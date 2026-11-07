@@ -21,10 +21,11 @@ internal enum TrayState
 /// <summary>
 /// Renders the tray icon with GDI+, so the app ships without image assets.
 ///
-/// The icon is a battery lying on its side - wide rounded body, small terminal on the right - with
+/// The icon is a battery lying on its side - wide rounded body, short terminal on the right - with
 /// the percentage set inside it in a real typeface. Lying it down is what makes the silhouette read
 /// as a battery; a square body with a tab on top reads as a jar. Everything is drawn at 4x and
-/// scaled down with a high-quality filter, so the edges are smooth at tray size.
+/// scaled down with a high-quality filter, so the edges are smooth at tray size, and the type is
+/// fitted by its actual ink so the digits always sit fully inside the body.
 /// </summary>
 internal static class TrayIconRenderer
 {
@@ -44,7 +45,7 @@ internal static class TrayIconRenderer
             graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
             graphics.TextRenderingHint = TextRenderingHint.AntiAlias;
             graphics.Clear(Color.Transparent);
-            Draw(graphics, state, percent, size, canvas);
+            Draw(graphics, state, percent, canvas);
         }
 
         using var bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb);
@@ -87,7 +88,7 @@ internal static class TrayIconRenderer
         _ => "no mouse",
     };
 
-    private static void Draw(Graphics graphics, TrayState state, int percent, int size, int canvas)
+    private static void Draw(Graphics graphics, TrayState state, int percent, int canvas)
     {
         Color accent = ColorFor(state);
         float s = canvas / (float)Supersample; // one final pixel, in canvas units
@@ -122,29 +123,26 @@ internal static class TrayIconRenderer
             body);
     }
 
-    /// <summary>Draws the percentage centred in the battery body, cropping to the ink so it is optically centred.</summary>
+    /// <summary>
+    /// Draws the percentage inside the battery body. The type is sized by its measured ink, not by
+    /// its em box, so it can never spill past the body - which is what broke at 16 px.
+    /// </summary>
     private static void DrawPercent(Graphics graphics, string text, int canvas, RectangleF body)
     {
+        float maxWidth = body.Width * 0.84f;
+        float maxHeight = body.Height * 0.80f;
+
         using var layer = new Bitmap(canvas, canvas, PixelFormat.Format32bppArgb);
+        Rectangle ink = Rectangle.Empty;
 
-        using (Graphics textGraphics = Graphics.FromImage(layer))
+        foreach (float factor in new[] { 1.10f, 1.00f, 0.92f, 0.84f, 0.76f, 0.68f, 0.60f })
         {
-            textGraphics.Clear(Color.Transparent);
-            textGraphics.TextRenderingHint = TextRenderingHint.AntiAlias;
-            textGraphics.SmoothingMode = SmoothingMode.AntiAlias;
+            RenderTextLayer(layer, text, body.Height * factor);
+            ink = InkBounds(layer);
 
-            float maxWidth = body.Width * 0.86f;
-            float em = body.Height * 1.00f;
-            using Font font = FitFont(textGraphics, text, em, maxWidth);
-
-            using var brush = new SolidBrush(Color.White);
-            using var format = (StringFormat)StringFormat.GenericTypographic.Clone();
-            format.FormatFlags |= StringFormatFlags.NoWrap | StringFormatFlags.NoClip;
-
-            textGraphics.DrawString(text, font, brush, 0f, 0f, format);
+            if (ink.Width <= maxWidth && ink.Height <= maxHeight) break;
         }
 
-        Rectangle ink = InkBounds(layer);
         if (ink.Width <= 0 || ink.Height <= 0) return;
 
         using Bitmap cropped = layer.Clone(ink, PixelFormat.Format32bppArgb);
@@ -156,38 +154,25 @@ internal static class TrayIconRenderer
         graphics.DrawImage(
             cropped,
             new RectangleF(
-                centreX - ink.Width / 2f,
-                centreY - ink.Height / 2f,
-                ink.Width,
-                ink.Height));
+                centreX - cropped.Width / 2f,
+                centreY - cropped.Height / 2f,
+                cropped.Width,
+                cropped.Height));
     }
 
-    /// <summary>Largest bold UI font that still fits the width; Segoe UI is what Windows itself uses.</summary>
-    private static Font FitFont(Graphics graphics, string text, float em, float maxWidth)
+    private static void RenderTextLayer(Bitmap layer, string text, float em)
     {
-        float[] candidates =
-        {
-            em,
-            em * 0.92f,
-            em * 0.84f,
-            em * 0.76f,
-            em * 0.68f,
-            em * 0.60f,
-        };
+        using Graphics graphics = Graphics.FromImage(layer);
+        graphics.Clear(Color.Transparent);
+        graphics.TextRenderingHint = TextRenderingHint.AntiAlias;
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
 
-        Font? last = null;
+        using Font font = CreateFont(em);
+        using var brush = new SolidBrush(Color.White);
+        using var format = (StringFormat)StringFormat.GenericTypographic.Clone();
+        format.FormatFlags |= StringFormatFlags.NoWrap | StringFormatFlags.NoClip;
 
-        foreach (float candidate in candidates)
-        {
-            Font font = CreateFont(candidate);
-            last?.Dispose();
-            last = font;
-
-            if (graphics.MeasureString(text, font, PointF.Empty, StringFormat.GenericTypographic).Width <= maxWidth)
-                return font;
-        }
-
-        return last ?? CreateFont(em * 0.60f);
+        graphics.DrawString(text, font, brush, 0f, 0f, format);
     }
 
     private static Font CreateFont(float em)
@@ -207,7 +192,7 @@ internal static class TrayIconRenderer
         return new Font(FontFamily.GenericSansSerif, em, FontStyle.Bold, GraphicsUnit.Pixel);
     }
 
-    /// <summary>Bounding box of the non-transparent pixels, so text can be centred by its ink.</summary>
+    /// <summary>Bounding box of the non-transparent pixels, so text can be fitted and centred by its ink.</summary>
     private static Rectangle InkBounds(Bitmap bitmap)
     {
         BitmapData data = bitmap.LockBits(

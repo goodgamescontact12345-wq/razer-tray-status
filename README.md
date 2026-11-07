@@ -8,6 +8,13 @@ Battery levels are read straight from the mouse over USB HID (the protocol rever
 [OpenRazer](https://github.com/openrazer/openrazer)). Synapse does not need to be running to read
 the level — it only opens when you click the icon.
 
+## Download
+
+Grab `RazerTrayStatus.exe` from the
+[latest release](https://github.com/goodgamescontact12345-wq/razer-tray-status/releases/latest) and
+run it. It is self-contained, so no .NET installation is needed. The exe is unsigned, so SmartScreen
+may warn on first launch: choose *More info*, then *Run anyway*.
+
 ## Features
 
 - Every connected Razer mouse is listed in the tray menu with its live battery percentage.

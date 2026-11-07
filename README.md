@@ -2,9 +2,6 @@
 
 Battery level of your Razer wireless mouse in the Windows system tray.
 
-It shows every Razer mouse you have connected, lets you pin one of them to the tray, and opens Razer
-Synapse when you click the icon.
-
 ## Download
 
 Get `RazerTrayStatus.exe` from the
@@ -13,17 +10,6 @@ run it. There is nothing to install.
 
 The file is not signed, so Windows SmartScreen may warn you the first time. Click *More info*, then
 *Run anyway*.
-
-## What it does
-
-- Shows the battery percentage of every connected Razer mouse.
-- Pin one mouse to the tray icon. It stays pinned across restarts and replugging.
-- The icon is a small battery with the percentage inside it, and its colour tells you the level.
-- Left click opens Razer Synapse. Right click opens the menu: your mice, *Open Razer Synapse*,
-  *Refresh now*, *Settings*, *Device diagnostics* and *Exit*.
-- *Settings* sets how often it checks (15 seconds to 5 minutes), when it warns you about a low
-  battery, and whether it starts with Windows.
-- No drivers and no admin rights.
 
 ## Colours
 
@@ -34,8 +20,6 @@ The file is not signed, so Windows SmartScreen may warn you the first time. Clic
 | Red | 5% or less, charge it |
 | Blue | Charging |
 | Grey `?` | The mouse did not answer |
-
-The menu uses the same words: `72% · good`, `30% · getting low`.
 
 ## What you need
 
@@ -48,5 +32,4 @@ you want the click to open it.
 - **It says `no battery answer`.** Windows sees the mouse but it is not replying, usually because it
   is asleep. It comes back as soon as it answers.
 - **Synapse does not open.** Razer Synapse 4 or 3 has to be installed.
-- **Anything else.** *Device diagnostics* writes a log and opens it, which is the thing to attach if
-  you report a problem.
+- **Anything else.** *Device diagnostics* writes a log and opens it, then open an issue so i can fix it

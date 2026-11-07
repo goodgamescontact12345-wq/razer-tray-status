@@ -91,7 +91,10 @@ internal static class TrayIconRenderer
     private static void Draw(Graphics graphics, TrayState state, int percent, int canvas)
     {
         Color accent = ColorFor(state);
-        float s = canvas / (float)Supersample; // one final pixel, in canvas units
+
+        // The fractions below are of the whole icon, so they scale with the canvas. Scaling them by
+        // one pixel instead drew the body 0.8 px wide - a dot in the corner of a 16 px icon.
+        float s = canvas;
 
         // Wide body with a short terminal on the right: the classic battery silhouette.
         var body = new RectangleF(s * 0.03f, s * 0.19f, s * 0.76f, s * 0.62f);

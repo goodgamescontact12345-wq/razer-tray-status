@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>RazerTrayStatus</AssemblyName>
+    <RootNamespace>RazerTrayStatus</RootNamespace>
+    <!-- Allows building the Windows target from Linux/macOS CI. Harmless on Windows. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Version>1.0.0</Version>
+    <Product>Razer Tray Status</Product>
+    <Company>razer-tray-status</Company>
+    <Description>Shows the battery level of Razer wireless mice in the Windows system tray.</Description>
+  </PropertyGroup>
+
+</Project>

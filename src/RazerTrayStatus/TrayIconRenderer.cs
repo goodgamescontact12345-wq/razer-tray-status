@@ -93,7 +93,7 @@ internal static class TrayIconRenderer
         float s = canvas / (float)Supersample; // one final pixel, in canvas units
 
         // Wide body with a short terminal on the right: the classic battery silhouette.
-        var body = new RectangleF(s * 0.03f, s * 0.145f, s * 0.76f, s * 0.71f);
+        var body = new RectangleF(s * 0.03f, s * 0.19f, s * 0.76f, s * 0.62f);
         var terminal = new RectangleF(s * 0.82f, s * 0.34f, s * 0.15f, s * 0.32f);
 
         using GraphicsPath bodyPath = RoundedRect(body, s * 0.115f);
@@ -133,8 +133,8 @@ internal static class TrayIconRenderer
             textGraphics.TextRenderingHint = TextRenderingHint.AntiAlias;
             textGraphics.SmoothingMode = SmoothingMode.AntiAlias;
 
-            float maxWidth = body.Width * 0.88f;
-            float em = body.Height * 0.98f;
+            float maxWidth = body.Width * 0.86f;
+            float em = body.Height * 1.00f;
             using Font font = FitFont(textGraphics, text, em, maxWidth);
 
             using var brush = new SolidBrush(Color.White);

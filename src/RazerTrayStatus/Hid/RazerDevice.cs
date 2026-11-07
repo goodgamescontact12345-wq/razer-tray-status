@@ -3,13 +3,17 @@ using System.Runtime.InteropServices;
 namespace RazerTrayStatus.Hid;
 
 /// <summary>
-/// A single Razer HID control interface and the battery queries that run against it.
+/// One Razer HID collection and the battery queries that run against it.
 ///
 /// Protocol (reverse engineered by OpenRazer, reused by every Windows Razer battery tool):
 ///   90-byte feature report: [0]=status [1]=transaction id [5]=data size
 ///   [6]=command class [7]=command id [8..]=arguments [88..89]=CRC (XOR of bytes 2..87)
 ///   Battery: class 0x07 id 0x80, args[1] is 0..255 -> percent
 ///   Charging: class 0x07 id 0x84, args[1] is 0/1
+///
+/// A single physical mouse exposes several collections (mouse, keyboard, vendor); only some of
+/// them answer, and which one differs between models and between wired and wireless mode. That is
+/// why the app groups these into <see cref="RazerMouse"/> and probes each in turn.
 /// </summary>
 internal sealed class RazerDevice
 {
@@ -24,13 +28,22 @@ internal sealed class RazerDevice
     /// <summary>Transaction ids to try, in order: modern mice, older receivers, then the legacy default.</summary>
     public static readonly byte[] TransactionIds = { 0x1F, 0x3F, 0xFF };
 
-    public RazerDevice(string devicePath, string productName, string serial, ushort productId, int featureReportLength)
+    public RazerDevice(
+        string devicePath,
+        string productName,
+        string serial,
+        ushort productId,
+        int featureReportLength,
+        ushort usagePage,
+        ushort usage)
     {
         DevicePath = devicePath;
         ProductName = productName;
         Serial = serial;
         ProductId = productId;
         FeatureReportLength = featureReportLength;
+        UsagePage = usagePage;
+        Usage = usage;
     }
 
     public string DevicePath { get; }
@@ -38,8 +51,15 @@ internal sealed class RazerDevice
     public string Serial { get; }
     public ushort ProductId { get; }
     public int FeatureReportLength { get; }
+    public ushort UsagePage { get; }
+    public ushort Usage { get; }
 
-    /// <summary>Stable identity for pinning: the device serial, falling back to its HID path.</summary>
+    /// <summary>True for the collection Windows itself uses as a mouse (usage page 1, usage 2).</summary>
+    public bool IsMouseCollection => UsagePage == 0x01 && Usage == 0x02;
+
+    /// <summary>Can this collection hold a 90-byte Razer report (report id included)?</summary>
+    public bool CanCarryControlReport => FeatureReportLength >= 91;
+
     public string Key => string.IsNullOrWhiteSpace(Serial) ? DevicePath : Serial.Trim();
 
     public string DisplayName =>
@@ -47,69 +67,83 @@ internal sealed class RazerDevice
 
     public static int PercentFromRaw(byte raw) => Math.Clamp((int)Math.Round(raw * 100.0 / 255.0), 0, 100);
 
+    /// <summary>
+    /// Reads level and charging state. Mice are locked by mouclass for read/write, so a
+    /// zero-access (feature-report-only) handle is tried first, then a full-access one.
+    /// </summary>
     public bool TryRead(byte transactionId, out int percent, out bool charging, out string error)
     {
         percent = 0;
         charging = false;
-        error = string.Empty;
+        error = "could not open device";
 
-        IntPtr handle = NativeHid.OpenDevice(DevicePath);
-        if (handle == NativeHid.InvalidHandle)
+        foreach (bool zeroAccess in new[] { true, false })
         {
-            error = "could not open device";
-            return false;
+            IntPtr handle = NativeHid.OpenDevice(DevicePath, zeroAccess);
+            if (handle == NativeHid.InvalidHandle) continue;
+
+            try
+            {
+                if (TryRead(handle, transactionId, out percent, out charging, out error)) return true;
+            }
+            finally
+            {
+                NativeHid.CloseHandle(handle);
+            }
         }
 
-        try
-        {
-            if (!TryQuery(handle, transactionId, GetBatteryLevel, out byte[] battery, out error)) return false;
-
-            percent = PercentFromRaw(battery[9]);
-
-            if (TryQuery(handle, transactionId, GetChargingStatus, out byte[] charge, out _))
-                charging = charge[9] != 0;
-
-            return true;
-        }
-        finally
-        {
-            NativeHid.CloseHandle(handle);
-        }
+        return false;
     }
 
-    /// <summary>Diagnostic read used by --probe; reports every step instead of failing silently.</summary>
+    private bool TryRead(IntPtr handle, byte transactionId, out int percent, out bool charging, out string error)
+    {
+        percent = 0;
+        charging = false;
+
+        if (!TryQuery(handle, transactionId, GetBatteryLevel, out byte[] battery, out error)) return false;
+
+        percent = PercentFromRaw(battery[9]);
+
+        if (TryQuery(handle, transactionId, GetChargingStatus, out byte[] charge, out _))
+            charging = charge[9] != 0;
+
+        return true;
+    }
+
+    /// <summary>Diagnostic read used by --probe and the diagnostics menu item.</summary>
     public bool TryProbe(byte transactionId, out string details)
     {
         details = string.Empty;
 
-        IntPtr handle = NativeHid.OpenDevice(DevicePath);
-        if (handle == NativeHid.InvalidHandle)
+        foreach (bool zeroAccess in new[] { true, false })
         {
-            details = "could not open device";
-            return false;
+            IntPtr handle = NativeHid.OpenDevice(DevicePath, zeroAccess);
+            if (handle == NativeHid.InvalidHandle) continue;
+
+            try
+            {
+                var parts = new List<string>();
+
+                bool batteryOk = TryQuery(handle, transactionId, GetBatteryLevel, out byte[] battery, out string batteryError);
+                parts.Add(batteryOk
+                    ? $"battery raw=0x{battery[9]:X2} -> {PercentFromRaw(battery[9])}%"
+                    : "battery: " + batteryError);
+
+                if (TryQuery(handle, transactionId, GetChargingStatus, out byte[] charge, out string chargeError))
+                    parts.Add($"charging={(charge[9] != 0 ? "yes" : "no")}");
+                else
+                    parts.Add("charging: " + chargeError);
+
+                details = string.Join(", ", parts);
+                if (batteryOk) return true;
+            }
+            finally
+            {
+                NativeHid.CloseHandle(handle);
+            }
         }
 
-        try
-        {
-            var parts = new List<string>();
-
-            bool batteryOk = TryQuery(handle, transactionId, GetBatteryLevel, out byte[] battery, out string batteryError);
-            parts.Add(batteryOk
-                ? $"battery raw=0x{battery[9]:X2} -> {PercentFromRaw(battery[9])}%"
-                : "battery: " + batteryError);
-
-            if (TryQuery(handle, transactionId, GetChargingStatus, out byte[] charge, out string chargeError))
-                parts.Add($"charging={(charge[9] != 0 ? "yes" : "no")}");
-            else
-                parts.Add("charging: " + chargeError);
-
-            details = string.Join(", ", parts);
-            return batteryOk;
-        }
-        finally
-        {
-            NativeHid.CloseHandle(handle);
-        }
+        return false;
     }
 
     private bool TryQuery(IntPtr handle, byte transactionId, byte commandId, out byte[] payload, out string error)
@@ -117,7 +151,7 @@ internal sealed class RazerDevice
         payload = Array.Empty<byte>();
         error = string.Empty;
 
-        int length = Math.Max(91, FeatureReportLength > 0 ? FeatureReportLength : 91);
+        int length = Math.Max(91, FeatureReportLength);
         byte[] frame = BuildRequest(transactionId, MiscCommandClass, commandId);
 
         var request = new byte[length];

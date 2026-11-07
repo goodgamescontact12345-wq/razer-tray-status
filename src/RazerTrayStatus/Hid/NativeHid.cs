@@ -185,25 +185,14 @@ internal static class NativeHid
     }
 
     /// <summary>
-    /// Opens a HID collection. Mice are owned exclusively by mouclass, so the first attempt uses
-    /// dwDesiredAccess = 0 (feature-report-only access); fall back to read/write if that fails.
+    /// Opens a HID collection. Mice are owned exclusively by mouclass, so zero access
+    /// (feature-report-only) is the normal choice; callers retry with full access when needed.
     /// </summary>
-    public static IntPtr OpenDevice(string devicePath)
+    public static IntPtr OpenDevice(string devicePath, bool zeroAccess = true)
     {
-        IntPtr handle = CreateFile(
-            devicePath,
-            0,
-            FileShareRead | FileShareWrite,
-            IntPtr.Zero,
-            OpenExisting,
-            0,
-            IntPtr.Zero);
-
-        if (handle != InvalidHandle) return handle;
-
         return CreateFile(
             devicePath,
-            GenericRead | GenericWrite,
+            zeroAccess ? 0u : GenericRead | GenericWrite,
             FileShareRead | FileShareWrite,
             IntPtr.Zero,
             OpenExisting,

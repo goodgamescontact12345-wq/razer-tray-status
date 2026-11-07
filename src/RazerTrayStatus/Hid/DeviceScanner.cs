@@ -4,66 +4,94 @@ namespace RazerTrayStatus.Hid;
 
 internal static class DeviceScanner
 {
-    private const int MinFeatureReportLength = 90;
+    private const int MinControlReportLength = 90;
 
-    private sealed record Candidate(
-        string Path,
-        string Product,
-        string Serial,
-        ushort ProductId,
-        ushort UsagePage,
-        ushort Usage,
-        int FeatureReportLength);
-
-    /// <summary>Finds every Razer mouse that exposes the 90-byte control report.</summary>
-    public static List<RazerDevice> Scan()
+    /// <summary>
+    /// Finds Razer mice, grouped per physical device, each with its HID collections ranked.
+    /// <paramref name="preferredControlPaths"/> holds the collection that answered last time.
+    /// </summary>
+    public static List<RazerMouse> Scan(Dictionary<string, string> preferredControlPaths)
     {
-        List<Candidate> candidates = ReadCandidates();
+        List<RazerDevice> interfaces = EnumerateInterfaces();
 
-        // Preferred: the mouse collection. Some models only answer on a vendor-defined collection,
-        // so fall back to any interface that can carry a 90-byte feature report.
-        List<Candidate> matches = candidates
-            .Where(c => c.UsagePage == 0x01 && c.Usage == 0x02 && c.FeatureReportLength >= MinFeatureReportLength)
+        // Normally the battery channel advertises a Razer-sized feature report. If the connected
+        // mouse advertises none (some wired/charging states), still surface it as a mouse so the
+        // user sees the device instead of nothing at all.
+        List<RazerDevice> candidates = interfaces
+            .Where(device => device.FeatureReportLength >= MinControlReportLength)
             .ToList();
 
-        if (matches.Count == 0)
-            matches = candidates.Where(c => c.FeatureReportLength >= MinFeatureReportLength).ToList();
+        if (candidates.Count == 0)
+            candidates = interfaces.Where(device => device.IsMouseCollection).ToList();
 
-        var devices = new List<RazerDevice>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var groups = new Dictionary<string, List<RazerDevice>>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (Candidate candidate in matches)
+        foreach (RazerDevice device in candidates)
         {
-            var device = new RazerDevice(
-                candidate.Path,
-                candidate.Product,
-                candidate.Serial,
-                candidate.ProductId,
-                candidate.FeatureReportLength);
-
-            // A dongle can expose the control report on more than one collection; keep one per device.
-            if (seen.Add(device.Key)) devices.Add(device);
+            string key = GroupKeyFor(device);
+            if (!groups.TryGetValue(key, out List<RazerDevice>? group))
+                groups[key] = group = new List<RazerDevice>();
+            group.Add(device);
         }
 
-        return devices;
+        var mice = new List<RazerMouse>();
+
+        foreach (KeyValuePair<string, List<RazerDevice>> group in groups)
+        {
+            preferredControlPaths.TryGetValue(group.Key, out string? preferredPath);
+            group.Value.Sort((left, right) => Rank(left, preferredPath).CompareTo(Rank(right, preferredPath)));
+
+            mice.Add(new RazerMouse(group.Key, group.Value[0].DisplayName, group.Value));
+        }
+
+        return mice
+            .OrderBy(mouse => mouse.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
     }
 
-    /// <summary>Human-readable list of every Razer HID interface, for --probe.</summary>
+    /// <summary>Human-readable list of every Razer HID collection, for diagnostics.</summary>
     public static List<string> DescribeAll()
     {
         var lines = new List<string>();
-        foreach (Candidate candidate in ReadCandidates())
+
+        foreach (RazerDevice device in EnumerateInterfaces())
         {
             lines.Add(
-                $"PID 0x{candidate.ProductId:X4}  usagePage 0x{candidate.UsagePage:X2} usage 0x{candidate.Usage:X2}  " +
-                $"feature {candidate.FeatureReportLength}B  \"{candidate.Product}\"  serial=\"{candidate.Serial}\"");
+                $"PID 0x{device.ProductId:X4}  usagePage 0x{device.UsagePage:X2} usage 0x{device.Usage:X2}  " +
+                $"feature {device.FeatureReportLength}B  \"{device.DisplayName}\"  serial=\"{device.Serial}\"");
         }
+
         return lines;
     }
 
-    private static List<Candidate> ReadCandidates()
+    private static string GroupKeyFor(RazerDevice device)
     {
-        var candidates = new List<Candidate>();
+        // The serial is the stable identity. Falling back to the model keeps one mouse's several
+        // HID collections from turning into several menu rows.
+        if (!string.IsNullOrWhiteSpace(device.Serial)) return device.Serial.Trim();
+        return $"{device.ProductId:X4}:{device.DisplayName}";
+    }
+
+    private static int Rank(RazerDevice device, string? preferredPath)
+    {
+        int score = 0;
+
+        // Remembered control collection always wins.
+        if (!string.IsNullOrEmpty(preferredPath) &&
+            string.Equals(device.DevicePath, preferredPath, StringComparison.OrdinalIgnoreCase))
+        {
+            score -= 1000;
+        }
+
+        if (device.IsMouseCollection) score -= 10;
+        score -= Math.Min(device.FeatureReportLength, 4096) / 16;
+
+        return score;
+    }
+
+    private static List<RazerDevice> EnumerateInterfaces()
+    {
+        var devices = new List<RazerDevice>();
 
         foreach (string path in NativeHid.EnumerateHidDevicePaths())
         {
@@ -93,21 +121,18 @@ internal static class DeviceScanner
                     NativeHid.HidD_FreePreparsedData(preparsed);
                 }
 
-                string product = NativeHid.ReadString(handle, NativeHid.HidD_GetProductString);
-                string serial = NativeHid.ReadString(handle, NativeHid.HidD_GetSerialNumberString);
-
-                candidates.Add(new Candidate(
+                devices.Add(new RazerDevice(
                     path,
-                    product,
-                    serial,
+                    NativeHid.ReadString(handle, NativeHid.HidD_GetProductString),
+                    NativeHid.ReadString(handle, NativeHid.HidD_GetSerialNumberString),
                     attributes.ProductID,
+                    caps.FeatureReportByteLength,
                     caps.UsagePage,
-                    caps.Usage,
-                    caps.FeatureReportByteLength));
+                    caps.Usage));
             }
             catch
             {
-                // A single inaccessible interface must never break discovery.
+                // A single inaccessible collection must never break discovery.
             }
             finally
             {
@@ -115,6 +140,6 @@ internal static class DeviceScanner
             }
         }
 
-        return candidates;
+        return devices;
     }
 }

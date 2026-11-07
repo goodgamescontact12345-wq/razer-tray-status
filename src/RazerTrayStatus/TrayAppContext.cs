@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Drawing;
 using System.Windows.Forms;
 using RazerTrayStatus.Hid;
 
@@ -10,6 +11,7 @@ internal sealed record DeviceSnapshot(
     int? Percent,
     bool Charging,
     byte TransactionId,
+    string? ControlPath,
     string? Error);
 
 internal sealed class TrayAppContext : ApplicationContext
@@ -17,7 +19,7 @@ internal sealed class TrayAppContext : ApplicationContext
     private const int MaxTooltipLength = 63;
 
     private readonly NotifyIcon _tray;
-    private readonly ContextMenuStrip _menu = new();
+    private readonly ContextMenuStrip _menu = new() { ShowItemToolTips = true };
     private readonly Control _anchor = new();
     private readonly SettingsStore _store = new();
     private readonly System.Windows.Forms.Timer _pollTimer = new();
@@ -33,11 +35,7 @@ internal sealed class TrayAppContext : ApplicationContext
         _ = _anchor.Handle; // needed so background polls can marshal back to the UI thread
         _settings = _store.Load();
 
-        _tray = new NotifyIcon
-        {
-            Text = "Razer tray status",
-            Visible = true,
-        };
+        _tray = new NotifyIcon { Text = "Razer tray status", Visible = true };
         SetTrayIcon(TrayState.NoDevice, -1);
 
         // No ContextMenuStrip assignment: that would make a left click open the menu too,
@@ -88,6 +86,20 @@ internal sealed class TrayAppContext : ApplicationContext
             MessageBoxIcon.Warning);
     }
 
+    private void ShowDiagnostics()
+    {
+        string report = Probe.BuildReport();
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(Probe.LogPath) { UseShellExecute = true });
+        }
+        catch
+        {
+            MessageBox.Show(report, "Razer tray status - diagnostics", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
     private void ApplyPollInterval()
     {
         int seconds = Math.Clamp(_settings.PollSeconds, 5, 3600);
@@ -99,15 +111,16 @@ internal sealed class TrayAppContext : ApplicationContext
         if (_polling) return;
         _polling = true;
 
-        // Snapshot the cached transaction ids so the worker never touches the live settings object.
+        // Snapshot the learned state so the worker never touches the live settings object.
         var cachedTransactionIds = new Dictionary<string, byte>(_settings.TransactionIds, StringComparer.OrdinalIgnoreCase);
+        var cachedControlPaths = new Dictionary<string, string>(_settings.ControlPaths, StringComparer.OrdinalIgnoreCase);
 
         Task.Run(() =>
         {
             List<DeviceSnapshot> snapshots;
             try
             {
-                snapshots = PollDevices(cachedTransactionIds);
+                snapshots = PollDevices(cachedTransactionIds, cachedControlPaths);
             }
             catch (Exception ex)
             {
@@ -139,41 +152,67 @@ internal sealed class TrayAppContext : ApplicationContext
         }
     }
 
-    private static List<DeviceSnapshot> PollDevices(Dictionary<string, byte> cachedTransactionIds)
+    private static List<DeviceSnapshot> PollDevices(
+        Dictionary<string, byte> cachedTransactionIds,
+        Dictionary<string, string> cachedControlPaths)
     {
         var snapshots = new List<DeviceSnapshot>();
 
-        foreach (RazerDevice device in DeviceScanner.Scan())
+        foreach (RazerMouse mouse in DeviceScanner.Scan(cachedControlPaths))
         {
-            byte transactionId = cachedTransactionIds.TryGetValue(device.Key, out byte cached)
+            byte transactionId = cachedTransactionIds.TryGetValue(mouse.Key, out byte cached)
                 ? cached
                 : RazerDevice.TransactionIds[0];
 
-            bool ok = device.TryRead(transactionId, out int percent, out bool charging, out string error);
+            bool answered = false;
+            int percent = 0;
+            bool charging = false;
+            string error = "no answer";
+            string? controlPath = null;
 
-            if (!ok)
+            // A mouse exposes several HID collections; the battery channel is not always the mouse
+            // one, so every collection is tried until one answers.
+            foreach (RazerDevice device in mouse.Interfaces)
             {
-                foreach (byte candidate in RazerDevice.TransactionIds)
-                {
-                    if (candidate == transactionId) continue;
-                    if (!device.TryRead(candidate, out percent, out charging, out error)) continue;
+                if (!TryReadInterface(device, ref transactionId, out percent, out charging, out error)) continue;
 
-                    transactionId = candidate;
-                    ok = true;
-                    break;
-                }
+                answered = true;
+                controlPath = device.DevicePath;
+                break;
             }
 
             snapshots.Add(new DeviceSnapshot(
-                device.Key,
-                device.DisplayName,
-                ok ? percent : null,
-                ok && charging,
+                mouse.Key,
+                mouse.DisplayName,
+                answered ? percent : null,
+                answered && charging,
                 transactionId,
-                ok ? null : error));
+                controlPath,
+                answered ? null : error));
         }
 
         return snapshots;
+    }
+
+    private static bool TryReadInterface(
+        RazerDevice device,
+        ref byte transactionId,
+        out int percent,
+        out bool charging,
+        out string error)
+    {
+        if (device.TryRead(transactionId, out percent, out charging, out error)) return true;
+
+        foreach (byte candidate in RazerDevice.TransactionIds)
+        {
+            if (candidate == transactionId) continue;
+            if (!device.TryRead(candidate, out percent, out charging, out error)) continue;
+
+            transactionId = candidate;
+            return true;
+        }
+
+        return false;
     }
 
     private void ApplyPollResult(List<DeviceSnapshot> snapshots)
@@ -186,10 +225,20 @@ internal sealed class TrayAppContext : ApplicationContext
             _snapshots[snapshot.Key] = snapshot;
 
             if (snapshot.Error is not null) continue;
-            if (_settings.TransactionIds.TryGetValue(snapshot.Key, out byte existing) && existing == snapshot.TransactionId) continue;
 
-            _settings.TransactionIds[snapshot.Key] = snapshot.TransactionId;
-            settingsChanged = true;
+            if (!_settings.TransactionIds.TryGetValue(snapshot.Key, out byte existingId) || existingId != snapshot.TransactionId)
+            {
+                _settings.TransactionIds[snapshot.Key] = snapshot.TransactionId;
+                settingsChanged = true;
+            }
+
+            if (snapshot.ControlPath is { Length: > 0 } path &&
+                (!_settings.ControlPaths.TryGetValue(snapshot.Key, out string? current) ||
+                 !string.Equals(current, path, StringComparison.OrdinalIgnoreCase)))
+            {
+                _settings.ControlPaths[snapshot.Key] = path;
+                settingsChanged = true;
+            }
         }
 
         if (settingsChanged) _store.Save(_settings);
@@ -197,20 +246,24 @@ internal sealed class TrayAppContext : ApplicationContext
         UpdateTray();
     }
 
+    private DeviceSnapshot? PinnedSnapshot()
+    {
+        if (!string.IsNullOrEmpty(_settings.PinnedDeviceKey) &&
+            _snapshots.TryGetValue(_settings.PinnedDeviceKey, out DeviceSnapshot? pinned))
+        {
+            return pinned;
+        }
+
+        // Nothing pinned and only one mouse around: showing it is what the user expects.
+        if (string.IsNullOrEmpty(_settings.PinnedDeviceKey) && _snapshots.Count == 1)
+            return _snapshots.Values.First();
+
+        return null;
+    }
+
     private void UpdateTray()
     {
-        DeviceSnapshot? pinned = null;
-
-        if (!string.IsNullOrEmpty(_settings.PinnedDeviceKey) &&
-            _snapshots.TryGetValue(_settings.PinnedDeviceKey, out DeviceSnapshot? found))
-        {
-            pinned = found;
-        }
-        else if (string.IsNullOrEmpty(_settings.PinnedDeviceKey) && _snapshots.Count == 1)
-        {
-            // Nothing pinned and only one mouse around: showing it is what the user expects.
-            pinned = _snapshots.Values.First();
-        }
+        DeviceSnapshot? pinned = PinnedSnapshot();
 
         TrayState state;
         int percent = -1;
@@ -238,7 +291,7 @@ internal sealed class TrayAppContext : ApplicationContext
         else if (pinned.Percent is null)
         {
             state = TrayState.Asleep;
-            text = $"{pinned.Name}: not responding (idle or off)";
+            text = $"{pinned.Name}: no battery answer (wired or idle)";
         }
         else
         {
@@ -272,25 +325,23 @@ internal sealed class TrayAppContext : ApplicationContext
 
         if (_snapshots.Count == 0)
         {
-            _menu.Items.Add(new ToolStripMenuItem(_settings.PinnedDeviceName is { Length: > 0 } pinnedName
-                ? $"No mouse connected ({pinnedName})"
-                : "No Razer mouse detected")
-            {
-                Enabled = false,
-            });
+            _menu.Items.Add(Greyed("No Razer mouse detected"));
+            _menu.Items.Add(Greyed("Device diagnostics explains why"));
         }
         else
         {
             foreach (DeviceSnapshot snapshot in _snapshots.Values
                          .OrderBy(s => s.Name, StringComparer.CurrentCultureIgnoreCase))
             {
-                string status = snapshot.Percent is int value ? $"{value}%" : "—";
-                if (snapshot.Charging) status += " (charging)";
+                string status = snapshot.Percent is int value
+                    ? value + "%" + (snapshot.Charging ? " (charging)" : string.Empty)
+                    : "no battery answer";
 
-                var item = new ToolStripMenuItem($"{status}   {snapshot.Name}")
+                var item = new ToolStripMenuItem($"{snapshot.Name}  —  {status}")
                 {
                     Checked = string.Equals(snapshot.Key, _settings.PinnedDeviceKey, StringComparison.OrdinalIgnoreCase),
                     CheckOnClick = false,
+                    ToolTipText = "Pin this mouse to the tray icon",
                 };
 
                 string key = snapshot.Key;
@@ -298,13 +349,33 @@ internal sealed class TrayAppContext : ApplicationContext
                 item.Click += (_, _) => PinDevice(key, name);
                 _menu.Items.Add(item);
             }
+
+            if (string.IsNullOrEmpty(_settings.PinnedDeviceKey) && _snapshots.Count > 1)
+                _menu.Items.Add(Greyed("Click a mouse above to pin it to the tray"));
         }
 
         _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(Action("Open Razer Synapse", OpenSynapse));
-        _menu.Items.Add(Action("Refresh now", StartPoll));
-        _menu.Items.Add(PollIntervalMenu());
-        _menu.Items.Add(LowBatteryMenu());
+
+        var openSynapse = new ToolStripMenuItem("Open Razer Synapse") { Font = new Font(_menu.Font, FontStyle.Bold) };
+        openSynapse.Click += (_, _) => OpenSynapse();
+        _menu.Items.Add(openSynapse);
+
+        var refresh = new ToolStripMenuItem("Refresh now") { ShortcutKeyDisplayString = "F5" };
+        refresh.Click += (_, _) => StartPoll();
+        _menu.Items.Add(refresh);
+
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(SettingsMenu());
+        _menu.Items.Add(Action("Device diagnostics…", ShowDiagnostics));
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(Action("Exit", ExitThread));
+    }
+
+    private ToolStripMenuItem SettingsMenu()
+    {
+        var root = new ToolStripMenuItem("Settings");
+        root.DropDownItems.Add(PollIntervalMenu());
+        root.DropDownItems.Add(LowBatteryMenu());
 
         var startWithWindows = new ToolStripMenuItem("Start with Windows")
         {
@@ -317,10 +388,10 @@ internal sealed class TrayAppContext : ApplicationContext
             AutoStart.Apply(startWithWindows.Checked);
             _store.Save(_settings);
         };
-        _menu.Items.Add(startWithWindows);
+        root.DropDownItems.Add(new ToolStripSeparator());
+        root.DropDownItems.Add(startWithWindows);
 
-        _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(Action("Exit", ExitThread));
+        return root;
     }
 
     private ToolStripMenuItem PollIntervalMenu()
@@ -368,6 +439,8 @@ internal sealed class TrayAppContext : ApplicationContext
 
         return root;
     }
+
+    private static ToolStripMenuItem Greyed(string text) => new(text) { Enabled = false };
 
     private static ToolStripMenuItem Action(string text, Action action)
     {

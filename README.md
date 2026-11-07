@@ -13,7 +13,8 @@ the level — it only opens when you click the icon.
 - Every connected Razer mouse is listed in the tray menu with its live battery percentage.
 - Pin any one of them to the tray icon; the pin survives restarts and replugs.
 - Left click the tray icon → opens Razer Synapse (Synapse 4, falling back to Synapse 3).
-- Right click → device list, refresh, poll interval, low-battery threshold, start with Windows, exit.
+- Right click → your mice, *Open Razer Synapse*, *Refresh now*, *Settings* (poll interval, low-battery
+  level, start with Windows), *Device diagnostics…* and *Exit*.
 - Icon changes colour and fill level: normal, charging (bolt), low, critical, idle/unreachable.
 - No drivers, no admin rights, no Synapse dependency for reading, no bundled image assets.
 - Settings live in `%APPDATA%\RazerTrayStatus\settings.json`.
@@ -42,39 +43,47 @@ dotnet run --project src\RazerTrayStatus
 ## Usage
 
 1. Start `RazerTrayStatus.exe`. If exactly one mouse is connected it is shown immediately.
-2. Right-click the tray icon and click a mouse to pin it to the tray.
+2. Right-click the tray icon and click a mouse to pin it to the tray (a checkmark marks the pinned one).
 3. Hover the icon for the exact percentage; left-click it to open Razer Synapse.
-4. Use `Refresh now` to force a read, and `Refresh every` to change the polling interval.
+4. *Refresh now* forces a read; *Settings → Refresh every* changes the polling interval (15 s, 30 s,
+   1 minute or 5 minutes, default 1 minute).
 
-Only `Refresh every` values of 15 s, 30 s, 1 min and 5 min are offered; the default is 1 minute.
+When a mouse is detected but does not answer the battery query (for example while it is wired and
+charging, or asleep on its dongle) it is still listed, marked `no battery answer`, and is still
+pinnable — it simply shows no percentage until it answers again.
 
 ## Supported mice
 
-Any Razer wireless mouse that exposes the 90-byte HID control report on a mouse collection
-(usage page `0x01`, usage `0x02`) works: typical 2021+ models answer on transaction `0x1F`, older
-receivers on `0x3F` or `0xFF`, and the app tries all three automatically and remembers the one your
-device answered on.
+Any Razer wireless mouse that exposes the 90-byte HID control report works, **including while it is
+plugged in and charging over the cable**. Typical 2021+ models answer on transaction `0x1F`, older
+receivers on `0x3F` or `0xFF`; the app tries all three and remembers which one your device answered
+on.
 
-Wired-only mice have no battery and are not listed.
+A mouse exposes several HID collections (mouse, keyboard, vendor) and which one carries the battery
+command differs by model and by wired/wireless mode — so the app probes every collection of the
+device and remembers the one that answered. This is why a wired Viper V3 is found even though its
+battery channel is not on the same collection as on other models.
+
+Wired-only mice have no battery and report nothing.
 
 ## Troubleshooting
 
-Run the probe from a console so it attaches to your terminal:
+Right-click the tray icon and choose **Device diagnostics…** — it opens
+`%APPDATA%\RazerTrayStatus\probe.log` describing every Razer HID collection, its usage page and
+feature report length, and what each transaction id answered. From a console you can get the same
+output with:
 
 ```bat
 RazerTrayStatus.exe --probe
 ```
 
-It prints every Razer HID interface it can open (product id, usage page/usage, feature report
-length, serial) plus the raw battery and charging answer for each transaction id, and also writes
-`%APPDATA%\RazerTrayStatus\probe.log`. If a mouse is missing from the list, or every transaction id
-reports "no answer", that output is what identifies the cause.
-
 Common cases:
 
-- **Mouse is not listed** — the mouse or dongle is unplugged, or the mouse is asleep; wake it and
-  refresh.
-- **"not responding (idle or off)"** — the interface exists but the mouse did not answer the query.
+- **Mouse is not listed at all** — the mouse or dongle is not enumerated; check the cable/dongle and
+  wake the mouse, then *Refresh now*.
+- **"no battery answer"** — Windows sees the mouse but it refused the battery query over the cable.
+  The diagnostics log shows the exact failure (`SetFeature failed (win32 5)`, `no valid response`,
+  and so on) for each collection and transaction id.
 - **Synapse does not open** — the app looks for
   `C:\Program Files\Razer\RazerAppEngine\RazerAppEngine.exe` (Synapse 4, also under its
   `app-<version>` folder) and then for Synapse 3's Razer Central. The error dialog lists the paths

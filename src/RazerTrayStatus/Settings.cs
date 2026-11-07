@@ -18,6 +18,9 @@ internal sealed class Settings
 
     /// <summary>Working protocol transaction id per device, learned on first successful read.</summary>
     public Dictionary<string, byte> TransactionIds { get; set; } = new();
+
+    /// <summary>Which HID collection answered for a device, learned on first successful read.</summary>
+    public Dictionary<string, string> ControlPaths { get; set; } = new();
 }
 
 internal sealed class SettingsStore

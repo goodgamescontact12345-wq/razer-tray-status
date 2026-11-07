@@ -220,9 +220,12 @@ internal static class NativeHid
                     if (!SetupDiGetDeviceInterfaceDetail(deviceInfoSet, ref interfaceData, buffer, requiredSize, out _, IntPtr.Zero))
                         continue;
 
-                    string? path = Marshal.PtrToStringUni(buffer, (requiredSize - 4) / 2);
+                    // The path is a NUL-terminated wide string at offset 4. requiredSize includes
+                    // struct padding on 64-bit, so never trust a computed character count: reading
+                    // too far appends junk and CreateFile then fails with ERROR_INVALID_NAME (123).
+                    string? path = Marshal.PtrToStringUni(IntPtr.Add(buffer, 4));
                     if (string.IsNullOrWhiteSpace(path)) continue;
-                    paths.Add(path.TrimEnd('\0'));
+                    paths.Add(NormalizePath(path));
                 }
                 finally
                 {
@@ -236,6 +239,19 @@ internal static class NativeHid
         }
 
         return paths;
+    }
+
+    /// <summary>Strips a terminator and any junk that ended up after the interface GUID.</summary>
+    private static string NormalizePath(string path)
+    {
+        int terminator = path.IndexOf('\0');
+        if (terminator >= 0) path = path[..terminator];
+
+        // A HID interface path always ends with its class GUID, closed by '}'.
+        int guidEnd = path.LastIndexOf('}');
+        if (guidEnd >= 0 && guidEnd < path.Length - 1) path = path[..(guidEnd + 1)];
+
+        return path.Trim();
     }
 
     public static IntPtr OpenDevice(string devicePath, HidAccess access = HidAccess.None, bool overlapped = false)

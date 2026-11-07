@@ -33,7 +33,16 @@ internal static class DeviceScanner
 
             group.Value.Sort((left, right) => Rank(left, preferredPath).CompareTo(Rank(right, preferredPath)));
 
-            mice.Add(new RazerMouse(group.Key, group.Value[0].DisplayName, group.Value));
+            // Prefer a real product name from any collection; some only report the id.
+            string? productName = group.Value
+                .Select(device => device.ProductName)
+                .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name));
+
+            string displayName = string.IsNullOrWhiteSpace(productName)
+                ? group.Value[0].DisplayName
+                : productName.Trim();
+
+            mice.Add(new RazerMouse(group.Key, displayName, group.Value));
         }
 
         return mice
@@ -64,9 +73,9 @@ internal static class DeviceScanner
 
     private static string GroupKeyFor(RazerDevice device)
     {
-        // The serial is the stable identity. Falling back to the product id keeps one mouse's
-        // several HID collections from turning into several menu rows.
-        if (!string.IsNullOrWhiteSpace(device.Serial)) return device.Serial.Trim();
+        // Grouped by product id: one mouse exposes many collections, and some of them cannot be
+        // read at all, so a serial would split one mouse into several menu rows. Two mice of the
+        // same model therefore share a row; different models stay separate.
         return device.ProductId.ToString("X4", CultureInfo.InvariantCulture);
     }
 

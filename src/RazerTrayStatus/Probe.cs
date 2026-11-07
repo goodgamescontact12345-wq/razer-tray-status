@@ -65,7 +65,7 @@ internal static class Probe
                 builder.AppendLine($"  collection: {device.DevicePath}");
                 builder.AppendLine(
                     $"    usagePage 0x{device.UsagePage:X2} usage 0x{device.Usage:X2} " +
-                    $"feature {device.FeatureReportLength}B mouseCollection={device.IsMouseCollection}");
+                    $"feature {device.FeatureReportLength}B in {device.InputReportByteLength}B out {device.OutputReportByteLength}B mouseCollection={device.IsMouseCollection}");
 
                 foreach (string line in device.ProbeAll()) builder.AppendLine(line);
             }

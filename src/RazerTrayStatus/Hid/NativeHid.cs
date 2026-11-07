@@ -276,10 +276,15 @@ internal static class NativeHid
     }
 
     /// <summary>Writes a HID output report (used by devices that reject feature reports on Windows).</summary>
-    public static bool WriteOutputReport(IntPtr handle, byte[] buffer, int length, int timeoutMilliseconds)
+    public static bool WriteOutputReport(IntPtr handle, byte[] buffer, int length, int timeoutMilliseconds, out string error)
     {
+        error = string.Empty;
         IntPtr eventHandle = CreateEvent(IntPtr.Zero, true, false, null);
-        if (eventHandle == IntPtr.Zero) return false;
+        if (eventHandle == IntPtr.Zero)
+        {
+            error = "could not create an I/O event";
+            return false;
+        }
 
         try
         {
@@ -287,15 +292,28 @@ internal static class NativeHid
 
             if (!WriteFile(handle, buffer, (uint)length, IntPtr.Zero, ref overlapped))
             {
-                if (Marshal.GetLastWin32Error() != ErrorIoPending) return false;
+                int writeError = Marshal.GetLastWin32Error();
+                if (writeError != ErrorIoPending)
+                {
+                    error = $"WriteFile failed ({DescribeError(writeError)})";
+                    return false;
+                }
+
                 if (WaitForSingleObject(eventHandle, (uint)timeoutMilliseconds) != 0)
                 {
                     CancelIoEx(handle, ref overlapped);
+                    error = "output report write timed out";
                     return false;
                 }
             }
 
-            return GetOverlappedResult(handle, ref overlapped, out _, true);
+            if (!GetOverlappedResult(handle, ref overlapped, out uint transferred, true))
+            {
+                error = $"output report not accepted ({DescribeError(Marshal.GetLastWin32Error())}, worker={transferred})";
+                return false;
+            }
+
+            return true;
         }
         finally
         {
@@ -304,10 +322,15 @@ internal static class NativeHid
     }
 
     /// <summary>Reads one HID input report, bounded by a timeout. Returns bytes read, or -1.</summary>
-    public static int ReadInputReport(IntPtr handle, byte[] buffer, int timeoutMilliseconds)
+    public static int ReadInputReport(IntPtr handle, byte[] buffer, int timeoutMilliseconds, out string error)
     {
+        error = string.Empty;
         IntPtr eventHandle = CreateEvent(IntPtr.Zero, true, false, null);
-        if (eventHandle == IntPtr.Zero) return -1;
+        if (eventHandle == IntPtr.Zero)
+        {
+            error = "could not create an I/O event";
+            return -1;
+        }
 
         try
         {
@@ -315,15 +338,27 @@ internal static class NativeHid
 
             if (!ReadFile(handle, buffer, (uint)buffer.Length, IntPtr.Zero, ref overlapped))
             {
-                if (Marshal.GetLastWin32Error() != ErrorIoPending) return -1;
+                int readError = Marshal.GetLastWin32Error();
+                if (readError != ErrorIoPending)
+                {
+                    error = $"ReadFile failed ({DescribeError(readError)})";
+                    return -1;
+                }
+
                 if (WaitForSingleObject(eventHandle, (uint)timeoutMilliseconds) != 0)
                 {
                     CancelIoEx(handle, ref overlapped);
+                    error = "no input report (timeout)";
                     return -1;
                 }
             }
 
-            if (!GetOverlappedResult(handle, ref overlapped, out uint transferred, true)) return -1;
+            if (!GetOverlappedResult(handle, ref overlapped, out uint transferred, true))
+            {
+                error = $"input report failed ({DescribeError(Marshal.GetLastWin32Error())})";
+                return -1;
+            }
+
             return (int)Math.Min(transferred, (uint)buffer.Length);
         }
         finally
@@ -347,6 +382,7 @@ internal static class NativeHid
     public static string DescribeError(int error) => error switch
     {
         0 => "ok",
+        1 => "win32 1 (invalid function)",
         2 => "win32 2 (file not found)",
         5 => "win32 5 (access denied)",
         21 => "win32 21 (device not ready)",
@@ -354,6 +390,7 @@ internal static class NativeHid
         31 => "win32 31 (general failure)",
         32 => "win32 32 (in use by another process)",
         87 => "win32 87 (invalid parameter - feature report rejected)",
+        123 => "win32 123 (invalid name)",
         1167 => "win32 1167 (device not connected)",
         121 => "win32 121 (semaphore timeout)",
         _ => $"win32 {error}",

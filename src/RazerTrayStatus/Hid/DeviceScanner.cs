@@ -59,7 +59,8 @@ internal static class DeviceScanner
         {
             lines.Add(
                 $"PID 0x{device.ProductId:X4}  usagePage 0x{device.UsagePage:X2} usage 0x{device.Usage:X2}  " +
-                $"feature {device.FeatureReportLength}B  mouse={device.IsMouseCollection}  " +
+                $"feature {device.FeatureReportLength}B in {device.InputReportByteLength}B out {device.OutputReportByteLength}B  " +
+                $"mouse={device.IsMouseCollection}  " +
                 $"\"{device.DisplayName}\"  serial=\"{device.Serial}\"" +
                 (device.Opened ? string.Empty : $"  OPEN FAILED: {device.OpenError}") +
                 $"\n      {device.DevicePath}");
@@ -91,6 +92,7 @@ internal static class DeviceScanner
 
         if (!device.Opened) score += 500; // prefer one we can actually talk to
         if (device.IsMouseCollection) score -= 10;
+        if (device.CanCarryControlReport) score -= 30;
         if (device.FeatureReportLength >= MinControlReportLength) score -= 20;
         score -= Math.Min(device.FeatureReportLength, 4096) / 16;
 
@@ -112,6 +114,8 @@ internal static class DeviceScanner
             string product = string.Empty;
             string serial = string.Empty;
             int featureReportLength = 0;
+            int inputReportLength = 0;
+            int outputReportLength = 0;
             ushort usagePage = 0;
             ushort usage = 0;
             bool opened = false;
@@ -143,6 +147,8 @@ internal static class DeviceScanner
                             if (NativeHid.HidP_GetCaps(preparsed, ref caps) == NativeHid.HidpStatusSuccess)
                             {
                                 featureReportLength = caps.FeatureReportByteLength;
+                                inputReportLength = caps.InputReportByteLength;
+                                outputReportLength = caps.OutputReportByteLength;
                                 usagePage = caps.UsagePage;
                                 usage = caps.Usage;
                             }
@@ -169,6 +175,8 @@ internal static class DeviceScanner
                 serial,
                 productId,
                 featureReportLength,
+                inputReportLength,
+                outputReportLength,
                 usagePage,
                 usage,
                 opened,

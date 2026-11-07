@@ -22,15 +22,15 @@ internal sealed record ReadOutcome(
 /// <summary>
 /// One Razer HID collection and the battery queries that run against it.
 ///
-/// Protocol (reverse engineered by OpenRazer, reused by every Windows Razer battery tool):
-///   90-byte feature report: [0]=status [1]=transaction id [5]=data size
-///   [6]=command class [7]=command id [8..]=arguments [88..89]=CRC (XOR of bytes 2..87)
+/// Protocol (reverse engineered by OpenRazer):
+///   90-byte report: [0]=status [1]=transaction id [5]=data size [6]=command class
+///   [7]=command id [8..]=arguments [88]=CRC (XOR of bytes 2..87)
 ///   Battery: class 0x07 id 0x80, args[1] is 0..255 -> percent
 ///   Charging: class 0x07 id 0x84, args[1] is 0/1
 ///
-/// A physical mouse exposes several collections (mouse, keyboard, vendor) and which one answers
-/// differs by model and by wired/wireless mode. <see cref="Read"/> therefore walks every
-/// transaction id and both I/O strategies until something replies.
+/// Reply statuses: 0x00 new, **0x01 busy (read again)**, 0x02 success, 0x03 failure,
+/// 0x04 timeout, 0x05 not supported. The reply is never ready immediately: OpenRazer waits
+/// ~31 ms and then re-reads while the device reports busy, which is what this class does.
 /// </summary>
 internal sealed class RazerDevice
 {
@@ -39,9 +39,29 @@ internal sealed class RazerDevice
     private const byte MiscCommandClass = 0x07;
     private const byte GetBatteryLevel = 0x80;
     private const byte GetChargingStatus = 0x84;
+
     private const int ReportLength = 90;
+    private const int MinReportLength = 91;
+
+    private const byte StatusNewCommand = 0x00;
+    private const byte StatusBusy = 0x01;
     private const byte StatusSuccess = 0x02;
-    private const int InputReportAttempts = 2;
+    private const byte StatusFailure = 0x03;
+    private const byte StatusTimeout = 0x04;
+    private const byte StatusNotSupported = 0x05;
+
+    private const int ResponseDelayMilliseconds = 30;
+    private const int BusyRetryDelayMilliseconds = 10;
+    private const int BusyRetryAttempts = 10;
+    private const int InputReportAttempts = 5;
+
+    private enum ResponseState
+    {
+        Success,
+        Busy,
+        Failed,
+        NoReply,
+    }
 
     /// <summary>Transaction ids to try, in order: modern mice, older receivers, then the legacy default.</summary>
     public static readonly byte[] TransactionIds = { 0x1F, 0x3F, 0xFF };
@@ -52,6 +72,8 @@ internal sealed class RazerDevice
         string serial,
         ushort productId,
         int featureReportLength,
+        int inputReportLength,
+        int outputReportLength,
         ushort usagePage,
         ushort usage,
         bool opened = true,
@@ -62,6 +84,8 @@ internal sealed class RazerDevice
         Serial = serial;
         ProductId = productId;
         FeatureReportLength = featureReportLength;
+        InputReportByteLength = inputReportLength;
+        OutputReportByteLength = outputReportLength;
         UsagePage = usagePage;
         Usage = usage;
         Opened = opened;
@@ -73,6 +97,8 @@ internal sealed class RazerDevice
     public string Serial { get; }
     public ushort ProductId { get; }
     public int FeatureReportLength { get; }
+    public int InputReportByteLength { get; }
+    public int OutputReportByteLength { get; }
     public ushort UsagePage { get; }
     public ushort Usage { get; }
 
@@ -84,8 +110,10 @@ internal sealed class RazerDevice
     /// <summary>True for the collection Windows itself uses as a mouse (usage page 1, usage 2).</summary>
     public bool IsMouseCollection => UsagePage == 0x01 && Usage == 0x02;
 
-    /// <summary>Can this collection hold a 90-byte Razer report (report id included)?</summary>
-    public bool CanCarryControlReport => FeatureReportLength >= 91;
+    /// <summary>Can this collection carry a 90-byte Razer report, by feature or by input/output?</summary>
+    public bool CanCarryControlReport =>
+        FeatureReportLength >= MinReportLength ||
+        (InputReportByteLength >= MinReportLength && OutputReportByteLength >= MinReportLength);
 
     public string Key => string.IsNullOrWhiteSpace(Serial) ? DevicePath : Serial.Trim();
 
@@ -116,7 +144,11 @@ internal sealed class RazerDevice
 
         foreach (IoMode mode in modes)
         {
-            lastTransactionId = transactionIds[0];
+            if (!Supports(mode))
+            {
+                lastError = DescribeMissingChannel(mode);
+                continue;
+            }
 
             // Feature reports work on a zero-access handle; output/input reports need read/write
             // access plus overlapped I/O.
@@ -139,10 +171,7 @@ internal sealed class RazerDevice
 
                     try
                     {
-                        int percent = 0;
-                        bool charging = false;
-
-                        if (TryQuery(handle, mode, transactionId, out percent, out charging, out string error))
+                        if (TryQuery(handle, mode, transactionId, out int percent, out bool charging, out string error))
                             return new ReadOutcome(true, percent, charging, transactionId, mode, null);
 
                         lastError = error;
@@ -165,6 +194,12 @@ internal sealed class RazerDevice
 
         foreach (IoMode mode in new[] { IoMode.Feature, IoMode.OutputInput })
         {
+            if (!Supports(mode))
+            {
+                lines.Add($"    {mode}: skipped - {DescribeMissingChannel(mode)}");
+                continue;
+            }
+
             HidAccess[] accessModes = mode == IoMode.Feature
                 ? new[] { HidAccess.None, HidAccess.ReadWrite }
                 : new[] { HidAccess.ReadWrite };
@@ -198,6 +233,14 @@ internal sealed class RazerDevice
         return lines;
     }
 
+    private bool Supports(IoMode mode) => mode == IoMode.Feature
+        ? FeatureReportLength >= MinReportLength
+        : InputReportByteLength >= MinReportLength && OutputReportByteLength >= MinReportLength;
+
+    private string DescribeMissingChannel(IoMode mode) => mode == IoMode.Feature
+        ? $"no {MinReportLength}-byte feature report (feature {FeatureReportLength}B)"
+        : $"no {MinReportLength}-byte input/output reports (in {InputReportByteLength}B, out {OutputReportByteLength}B)";
+
     private bool TryQuery(
         IntPtr handle,
         IoMode mode,
@@ -230,7 +273,7 @@ internal sealed class RazerDevice
         payload = Array.Empty<byte>();
         error = string.Empty;
 
-        int length = Math.Max(91, FeatureReportLength);
+        int length = Math.Max(MinReportLength, FeatureReportLength);
         byte[] frame = BuildRequest(transactionId, MiscCommandClass, commandId);
 
         var request = new byte[length];
@@ -245,46 +288,154 @@ internal sealed class RazerDevice
                 return false;
             }
 
-            var featureResponse = new byte[length];
-            featureResponse[0] = 0x00; // report id, required on input
+            // The reply is never ready immediately; OpenRazer waits about 31 ms before reading.
+            Thread.Sleep(ResponseDelayMilliseconds);
 
-            if (!NativeHid.HidD_GetFeature(handle, featureResponse, length))
+            for (int attempt = 1; attempt <= BusyRetryAttempts; attempt++)
             {
-                error = $"GetFeature failed ({NativeHid.DescribeError(Marshal.GetLastWin32Error())})";
-                return false;
+                var response = new byte[length];
+                response[0] = 0x00; // report id, required on input
+
+                if (!NativeHid.HidD_GetFeature(handle, response, length))
+                {
+                    error = $"GetFeature failed ({NativeHid.DescribeError(Marshal.GetLastWin32Error())})";
+                    return false;
+                }
+
+                switch (Evaluate(response, commandId, out payload, out error))
+                {
+                    case ResponseState.Success:
+                        return true;
+
+                    case ResponseState.Busy:
+                        if (attempt == BusyRetryAttempts)
+                        {
+                            error = "device stayed busy (status 0x01) after " + BusyRetryAttempts + " reads";
+                            return false;
+                        }
+
+                        Thread.Sleep(BusyRetryDelayMilliseconds);
+                        continue;
+
+                    default:
+                        return false;
+                }
             }
 
-            return TryParseResponse(featureResponse, out payload, out error);
-        }
-
-        if (!NativeHid.WriteOutputReport(handle, request, length, NativeHid.IoTimeoutMilliseconds))
-        {
-            error = $"WriteFile failed ({NativeHid.DescribeError(Marshal.GetLastWin32Error())})";
             return false;
         }
 
-        var response = new byte[length];
-
-        for (int attempt = 0; attempt < InputReportAttempts; attempt++)
+        if (!NativeHid.WriteOutputReport(handle, request, length, NativeHid.IoTimeoutMilliseconds, out string writeError))
         {
-            int read = NativeHid.ReadInputReport(handle, response, NativeHid.IoTimeoutMilliseconds);
-            if (read <= 0)
-            {
-                error = "no input report (timeout)";
-                return false;
-            }
-
-            if (TryParseResponse(response, out payload, out _)) return true;
+            error = writeError;
+            return false;
         }
 
-        error = "input reports contained no battery reply";
+        Thread.Sleep(ResponseDelayMilliseconds);
+
+        for (int attempt = 1; attempt <= InputReportAttempts; attempt++)
+        {
+            var response = new byte[length];
+
+            int read = NativeHid.ReadInputReport(handle, response, NativeHid.IoTimeoutMilliseconds, out string readError);
+            if (read <= 0)
+            {
+                error = readError;
+                continue;
+            }
+
+            switch (Evaluate(response, commandId, out payload, out error))
+            {
+                case ResponseState.Success:
+                    return true;
+
+                case ResponseState.Busy:
+                    Thread.Sleep(BusyRetryDelayMilliseconds);
+                    continue;
+
+                default:
+                    return false;
+            }
+        }
+
+        if (string.IsNullOrEmpty(error)) error = "no usable input report";
         return false;
     }
+
+    /// <summary>Interprets a reply: success only on status 0x02 with a matching command echo.</summary>
+    private static ResponseState Evaluate(byte[] response, byte commandId, out byte[] payload, out string error)
+    {
+        payload = Array.Empty<byte>();
+        error = string.Empty;
+
+        if (!TryLocatePayload(response, out int offset, out byte status))
+        {
+            error = "no Razer reply in the report";
+            return ResponseState.NoReply;
+        }
+
+        if (status is StatusBusy or StatusNewCommand)
+        {
+            error = $"device busy (status 0x{status:X2})";
+            return ResponseState.Busy;
+        }
+
+        if (status != StatusSuccess)
+        {
+            error = DescribeStatus(status);
+            return ResponseState.Failed;
+        }
+
+        var parsed = new byte[ReportLength];
+        Array.Copy(response, offset, parsed, 0, ReportLength);
+
+        // Guard against a stale reply to an earlier command.
+        if (parsed[6] != MiscCommandClass || (parsed[7] & 0x7F) != (commandId & 0x7F))
+        {
+            error = $"reply does not match the request (class 0x{parsed[6]:X2} id 0x{parsed[7]:X2})";
+            return ResponseState.Busy;
+        }
+
+        payload = parsed;
+        return ResponseState.Success;
+    }
+
+    /// <summary>Finds the 90-byte payload, allowing for the optional report id at byte 0.</summary>
+    private static bool TryLocatePayload(byte[] response, out int offset, out byte status)
+    {
+        if (response.Length >= MinReportLength && response[0] == 0x00 && IsKnownStatus(response[1]))
+        {
+            offset = 1;
+            status = response[1];
+            return true;
+        }
+
+        if (response.Length > 0 && IsKnownStatus(response[0]))
+        {
+            offset = 0;
+            status = response[0];
+            return true;
+        }
+
+        offset = 0;
+        status = 0xFF;
+        return false;
+    }
+
+    private static bool IsKnownStatus(byte value) => value <= StatusNotSupported;
+
+    private static string DescribeStatus(byte status) => status switch
+    {
+        StatusFailure => "device reported failure (status 0x03)",
+        StatusTimeout => "device timed out (status 0x04) - it could not be reached",
+        StatusNotSupported => "command not supported by this device (status 0x05)",
+        _ => $"unexpected status 0x{status:X2}",
+    };
 
     public static byte[] BuildRequest(byte transactionId, byte commandClass, byte commandId, byte dataSize = 0x02)
     {
         var frame = new byte[ReportLength];
-        frame[0] = 0x00; // status: new command
+        frame[0] = StatusNewCommand;
         frame[1] = transactionId;
         frame[2] = 0x00; // remaining packets
         frame[3] = 0x00;
@@ -299,25 +450,5 @@ internal sealed class RazerDevice
         frame[89] = 0x00;
 
         return frame;
-    }
-
-    private static bool TryParseResponse(byte[] response, out byte[] payload, out string error)
-    {
-        // The report id is byte 0 when the device uses one; try both layouts.
-        foreach (int offset in new[] { 1, 0 })
-        {
-            if (response.Length < offset + ReportLength) continue;
-            if (response[offset] != StatusSuccess) continue;
-
-            payload = new byte[ReportLength];
-            Array.Copy(response, offset, payload, 0, ReportLength);
-            error = string.Empty;
-            return true;
-        }
-
-        payload = Array.Empty<byte>();
-        byte status = response.Length > 1 ? response[1] : response[0];
-        error = $"no valid response (status 0x{status:X2})";
-        return false;
     }
 }

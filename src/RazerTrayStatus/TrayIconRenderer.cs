@@ -19,10 +19,10 @@ internal enum TrayState
 /// <summary>
 /// Renders the tray icon with GDI+, so the app ships without image assets.
 ///
-/// The icon is a rounded badge: the background colour says how the battery is doing and the
-/// number says the exact level. Colours are deliberately dark enough for white digits to stay
-/// readable on any taskbar, and the digits come from a hand-drawn 3x5 font so they stay crisp
-/// at 16 px instead of being a downscaled picture.
+/// The icon is a battery - terminal on top, body below - with the percentage drawn inside the
+/// body. Standing it upright is what leaves the whole 16 px width free for the digits, which is
+/// what keeps the number readable at tray size. The digits come from a hand-drawn 3x5 font and
+/// each one gets a 1 px dark halo, so neighbouring strokes never merge into a single white bar.
 /// </summary>
 internal static class TrayIconRenderer
 {
@@ -87,37 +87,54 @@ internal static class TrayIconRenderer
     private static void Draw(Graphics graphics, TrayState state, int percent, int size)
     {
         Color accent = ColorFor(state);
-        var bounds = new RectangleF(0.5f, 0.5f, size - 1f, size - 1f);
-        float radius = Math.Max(2f, size * 0.26f);
 
-        using GraphicsPath path = RoundedRect(bounds, radius);
+        // Upright battery: small terminal on top, body below it, with a hair of space between.
+        float nubHeight = Math.Max(2f, size * 0.14f);
+        float nubWidth = size * 0.26f;
 
-        // A soft top-to-bottom shade keeps the badge from looking like a flat sticker.
+        var body = new RectangleF(
+            0.5f,
+            nubHeight + 0.6f,
+            size - 1f,
+            size - 0.5f - (nubHeight + 0.6f));
+
+        var nub = new RectangleF((size - nubWidth) / 2f, 0.5f, nubWidth, nubHeight);
+
+        using GraphicsPath bodyPath = RoundedRect(body, Math.Max(1.5f, size * 0.12f));
+        using GraphicsPath nubPath = RoundedRect(nub, Math.Max(0.8f, size * 0.05f));
+
+        // One shared gradient so the terminal and the body look like a single object.
         using (var fill = new LinearGradientBrush(
                    new RectangleF(0f, 0f, size, size),
-                   Blend(accent, 0.20f),
+                   Blend(accent, 0.18f),
                    Blend(accent, -0.10f),
                    90f))
         {
-            graphics.FillPath(fill, path);
+            graphics.FillPath(fill, bodyPath);
+            graphics.FillPath(fill, nubPath);
         }
 
-        using (var ring = new Pen(Color.FromArgb(80, 255, 255, 255), Math.Max(1f, size * 0.055f)))
-            graphics.DrawPath(ring, path);
+        // A hairline highlight separates the battery from a dark or a light taskbar.
+        using (var ring = new Pen(Color.FromArgb(95, 255, 255, 255), Math.Max(1f, size * 0.055f)))
+        {
+            graphics.DrawPath(ring, bodyPath);
+            graphics.DrawPath(ring, nubPath);
+        }
 
-        DrawNumber(graphics, percent is >= 0 and <= 100 ? percent.ToString() : "?", size);
+        DrawNumber(graphics, percent is >= 0 and <= 100 ? percent.ToString() : "?", size, body);
     }
 
-    private static void DrawNumber(Graphics graphics, string text, int size)
+    private static void DrawNumber(Graphics graphics, string text, int size, RectangleF body)
     {
         var glyphs = new List<string[]>(text.Length);
         foreach (char character in text)
             glyphs.Add(Glyphs.TryGetValue(character, out string[]? glyph) ? glyph : Glyphs['?']);
 
-        // Three digits get no gap, so "100" is still big enough to read at 16 px.
-        int gap = glyphs.Count > 2 ? 0 : 1;
+        // Two digits butt together and the dark halo separates them, which buys back the width
+        // the number needs at 16 px. Three digits keep a gap, or "100" reads as a row of bars.
+        int gap = glyphs.Count > 2 ? 1 : 0;
 
-        int units = gap * (glyphs.Count - 1);
+        int units = 0;
         foreach (string[] glyph in glyphs) units += glyph[0].Length;
 
         int scale = Math.Max(1, size / 8);
@@ -125,12 +142,32 @@ internal static class TrayIconRenderer
 
         int height = 5 * scale;
         int cursor = (size - units * scale) / 2;
-        int top = (size - height) / 2;
+        int top = (int)Math.Round(body.Y + (body.Height - height) / 2f);
 
         SmoothingMode previous = graphics.SmoothingMode;
         graphics.SmoothingMode = SmoothingMode.None;
 
-        using var brush = new SolidBrush(Color.White);
+        // Dark halo first, so adjacent strokes never read as one thick white bar.
+        using (var halo = new SolidBrush(Color.FromArgb(120, 12, 12, 14)))
+            DrawGlyphs(graphics, glyphs, halo, cursor, top, scale, gap, inflate: 1);
+
+        using (var brush = new SolidBrush(Color.White))
+            DrawGlyphs(graphics, glyphs, brush, cursor, top, scale, gap, inflate: 0);
+
+        graphics.SmoothingMode = previous;
+    }
+
+    private static void DrawGlyphs(
+        Graphics graphics,
+        List<string[]> glyphs,
+        Brush brush,
+        int cursor,
+        int top,
+        int scale,
+        int gap,
+        int inflate)
+    {
+        int x = cursor;
 
         foreach (string[] glyph in glyphs)
         {
@@ -146,17 +183,15 @@ internal static class TrayIconRenderer
 
                     graphics.FillRectangle(
                         brush,
-                        cursor + column * scale,
-                        top + row * scale,
-                        scale,
-                        scale);
+                        x + column * scale - inflate,
+                        top + row * scale - inflate,
+                        scale + inflate * 2,
+                        scale + inflate * 2);
                 }
             }
 
-            cursor += (width + gap) * scale;
+            x += (width + gap) * scale;
         }
-
-        graphics.SmoothingMode = previous;
     }
 
     private static Color Blend(Color color, float amount) => amount >= 0

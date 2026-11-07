@@ -15,7 +15,7 @@ the level — it only opens when you click the icon.
 - Left click the tray icon → opens Razer Synapse (Synapse 4, falling back to Synapse 3).
 - Right click → your mice, *Open Razer Synapse*, *Refresh now*, *Settings* (poll interval, low-battery
   level, start with Windows), *Device diagnostics…* and *Exit*.
-- The tray icon is a badge with the battery percentage drawn as big, crisp digits. Its colour
+- The tray icon is a battery with the percentage drawn inside it as big, crisp digits. Its colour
   explains the level at a glance (see below), and the menu spells the same thing out next to each
   mouse: `95% · good`, `30% · getting low`, `12% · charge now`, `95% · charging`.
 - No drivers, no admin rights, no Synapse dependency for reading, no bundled image assets.

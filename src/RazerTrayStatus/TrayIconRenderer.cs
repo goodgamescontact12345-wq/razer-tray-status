@@ -16,109 +16,163 @@ internal enum TrayState
     NoDevice,
 }
 
-/// <summary>Renders the tray icon with GDI+, so the app ships without image assets.</summary>
+/// <summary>
+/// Renders the tray icon with GDI+, so the app ships without image assets.
+///
+/// The icon is a rounded badge: the background colour says how the battery is doing and the
+/// number says the exact level. Colours are deliberately dark enough for white digits to stay
+/// readable on any taskbar, and the digits come from a hand-drawn 3x5 font so they stay crisp
+/// at 16 px instead of being a downscaled picture.
+/// </summary>
 internal static class TrayIconRenderer
 {
-    private const int IconSize = 32;
+    /// <summary>3x5 pixel digits. '1' is one pixel wide so "100%" still fits at 16 px.</summary>
+    private static readonly Dictionary<char, string[]> Glyphs = new()
+    {
+        ['0'] = new[] { "111", "101", "101", "101", "111" },
+        ['1'] = new[] { "1", "1", "1", "1", "1" },
+        ['2'] = new[] { "111", "001", "111", "100", "111" },
+        ['3'] = new[] { "111", "001", "111", "001", "111" },
+        ['4'] = new[] { "101", "101", "111", "001", "001" },
+        ['5'] = new[] { "111", "100", "111", "001", "111" },
+        ['6'] = new[] { "111", "100", "111", "101", "111" },
+        ['7'] = new[] { "111", "001", "001", "001", "001" },
+        ['8'] = new[] { "111", "101", "111", "101", "111" },
+        ['9'] = new[] { "111", "101", "111", "001", "111" },
+        ['?'] = new[] { "111", "001", "011", "000", "010" },
+    };
 
     public static Icon Create(TrayState state, int percent, out IntPtr handle)
     {
-        using var bitmap = new Bitmap(IconSize, IconSize, PixelFormat.Format32bppArgb);
+        int size = IconSize();
+
+        using var bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb);
 
         using (Graphics graphics = Graphics.FromImage(bitmap))
         {
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
             graphics.Clear(Color.Transparent);
-            Draw(graphics, state, percent);
+            Draw(graphics, state, percent, size);
         }
 
         handle = bitmap.GetHicon();
         return Icon.FromHandle(handle);
     }
 
-    private static void Draw(Graphics graphics, TrayState state, int percent)
+    /// <summary>Renders at the size the shell actually asks for, so nothing gets rescaled and blurred.</summary>
+    private static int IconSize() => Math.Clamp(SystemInformation.SmallIconSize.Width, 16, 64);
+
+    /// <summary>Green = plenty, orange = getting low, red = charge now, blue = charging, grey = unknown.</summary>
+    public static Color ColorFor(TrayState state) => state switch
     {
-        const float size = IconSize;
-        float padding = size * 0.10f;
-        float capHeight = size * 0.09f;
-        float capWidth = size * 0.36f;
+        TrayState.Normal => Color.FromArgb(255, 21, 128, 61),
+        TrayState.Charging => Color.FromArgb(255, 29, 78, 216),
+        TrayState.Low => Color.FromArgb(255, 180, 83, 9),
+        TrayState.Critical => Color.FromArgb(255, 185, 28, 28),
+        _ => Color.FromArgb(255, 82, 82, 91),
+    };
 
-        var cap = new RectangleF((size - capWidth) / 2f, padding * 0.5f, capWidth, capHeight);
-        var body = new RectangleF(padding, padding * 0.5f + capHeight, size - padding * 2f, size - padding * 1.5f - capHeight);
+    /// <summary>The same meaning in words, shown in the menu and the tooltip next to the percentage.</summary>
+    public static string Describe(TrayState state) => state switch
+    {
+        TrayState.Normal => "good",
+        TrayState.Charging => "charging",
+        TrayState.Low => "getting low",
+        TrayState.Critical => "charge now",
+        TrayState.Asleep => "no battery answer",
+        TrayState.Disconnected => "not connected",
+        _ => "no mouse",
+    };
 
-        Color color = ColorFor(state);
-        float radius = Math.Max(1.5f, size * 0.13f);
+    private static void Draw(Graphics graphics, TrayState state, int percent, int size)
+    {
+        Color accent = ColorFor(state);
+        var bounds = new RectangleF(0.5f, 0.5f, size - 1f, size - 1f);
+        float radius = Math.Max(2f, size * 0.26f);
 
-        using GraphicsPath bodyPath = RoundedRect(body, radius);
+        using GraphicsPath path = RoundedRect(bounds, radius);
 
-        using (var dim = new SolidBrush(Color.FromArgb(70, color)))
-            graphics.FillPath(dim, bodyPath);
-
-        if (percent >= 0)
+        // A soft top-to-bottom shade keeps the badge from looking like a flat sticker.
+        using (var fill = new LinearGradientBrush(
+                   new RectangleF(0f, 0f, size, size),
+                   Blend(accent, 0.20f),
+                   Blend(accent, -0.10f),
+                   90f))
         {
-            float fillHeight = body.Height * Math.Clamp(percent, 0, 100) / 100f;
-            var fillRect = new RectangleF(body.X, body.Y + body.Height - fillHeight, body.Width, fillHeight);
-
-            graphics.SetClip(bodyPath);
-            using var fill = new SolidBrush(color);
-            graphics.FillRectangle(fill, fillRect);
-            graphics.ResetClip();
+            graphics.FillPath(fill, path);
         }
 
-        using (var outline = new Pen(Color.FromArgb(190, color), Math.Max(1f, size * 0.06f)))
-            graphics.DrawPath(outline, bodyPath);
+        using (var ring = new Pen(Color.FromArgb(80, 255, 255, 255), Math.Max(1f, size * 0.055f)))
+            graphics.DrawPath(ring, path);
 
-        using (var capBrush = new SolidBrush(Color.FromArgb(190, color)))
-            graphics.FillRectangle(capBrush, cap);
-
-        if (state == TrayState.Charging)
-            DrawBolt(graphics, body);
-        else if (state is TrayState.Disconnected or TrayState.NoDevice)
-            DrawSlash(graphics, body);
+        DrawNumber(graphics, percent is >= 0 and <= 100 ? percent.ToString() : "?", size);
     }
 
-    private static void DrawBolt(Graphics graphics, RectangleF body)
+    private static void DrawNumber(Graphics graphics, string text, int size)
     {
-        float centerX = body.X + body.Width / 2f;
-        float centerY = body.Y + body.Height / 2f;
-        float halfWidth = body.Width * 0.30f;
-        float halfHeight = body.Height * 0.36f;
+        var glyphs = new List<string[]>(text.Length);
+        foreach (char character in text)
+            glyphs.Add(Glyphs.TryGetValue(character, out string[]? glyph) ? glyph : Glyphs['?']);
 
-        PointF[] points =
+        // Three digits get no gap, so "100" is still big enough to read at 16 px.
+        int gap = glyphs.Count > 2 ? 0 : 1;
+
+        int units = gap * (glyphs.Count - 1);
+        foreach (string[] glyph in glyphs) units += glyph[0].Length;
+
+        int scale = Math.Max(1, size / 8);
+        while (scale > 1 && units * scale > size - 2) scale--;
+
+        int height = 5 * scale;
+        int cursor = (size - units * scale) / 2;
+        int top = (size - height) / 2;
+
+        SmoothingMode previous = graphics.SmoothingMode;
+        graphics.SmoothingMode = SmoothingMode.None;
+
+        using var brush = new SolidBrush(Color.White);
+
+        foreach (string[] glyph in glyphs)
         {
-            new(centerX + halfWidth * 0.15f, centerY - halfHeight),
-            new(centerX - halfWidth, centerY + halfHeight * 0.10f),
-            new(centerX - halfWidth * 0.10f, centerY + halfHeight * 0.10f),
-            new(centerX - halfWidth * 0.15f, centerY + halfHeight),
-            new(centerX + halfWidth, centerY - halfHeight * 0.10f),
-            new(centerX + halfWidth * 0.10f, centerY - halfHeight * 0.10f),
-        };
+            int width = glyph[0].Length;
 
-        using var brush = new SolidBrush(Color.FromArgb(230, 20, 20, 20));
-        graphics.FillPolygon(brush, points);
+            for (int row = 0; row < glyph.Length; row++)
+            {
+                string line = glyph[row];
+
+                for (int column = 0; column < width; column++)
+                {
+                    if (line[column] != '1') continue;
+
+                    graphics.FillRectangle(
+                        brush,
+                        cursor + column * scale,
+                        top + row * scale,
+                        scale,
+                        scale);
+                }
+            }
+
+            cursor += (width + gap) * scale;
+        }
+
+        graphics.SmoothingMode = previous;
     }
 
-    private static void DrawSlash(Graphics graphics, RectangleF body)
-    {
-        using var pen = new Pen(Color.FromArgb(235, 220, 60, 60), Math.Max(2f, body.Width * 0.16f));
-        graphics.DrawLine(
-            pen,
-            body.X + body.Width * 0.12f,
-            body.Y + body.Height * 0.88f,
-            body.X + body.Width * 0.88f,
-            body.Y + body.Height * 0.12f);
-    }
+    private static Color Blend(Color color, float amount) => amount >= 0
+        ? Color.FromArgb(
+            color.A,
+            Lerp(color.R, 255, amount),
+            Lerp(color.G, 255, amount),
+            Lerp(color.B, 255, amount))
+        : Color.FromArgb(
+            color.A,
+            Lerp(color.R, 0, -amount),
+            Lerp(color.G, 0, -amount),
+            Lerp(color.B, 0, -amount));
 
-    private static Color ColorFor(TrayState state) => state switch
-    {
-        TrayState.Charging => Color.FromArgb(255, 138, 214, 106),
-        TrayState.Low => Color.FromArgb(255, 240, 180, 41),
-        TrayState.Critical => Color.FromArgb(255, 229, 72, 77),
-        TrayState.Disconnected => Color.FromArgb(255, 229, 72, 77),
-        TrayState.Asleep => Color.FromArgb(255, 148, 153, 162),
-        TrayState.NoDevice => Color.FromArgb(255, 148, 153, 162),
-        _ => Color.FromArgb(255, 235, 235, 235),
-    };
+    private static int Lerp(int from, int to, float amount) =>
+        (int)Math.Round(from + (to - from) * Math.Clamp(amount, 0f, 1f));
 
     private static GraphicsPath RoundedRect(RectangleF bounds, float radius)
     {

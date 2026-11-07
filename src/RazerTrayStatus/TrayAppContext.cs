@@ -342,20 +342,23 @@ internal sealed class TrayAppContext : ApplicationContext
         else
         {
             percent = pinned.Percent.Value;
-            state = pinned.Charging
-                ? TrayState.Charging
-                : percent <= 5
-                    ? TrayState.Critical
-                    : percent <= _settings.LowBatteryPercent
-                        ? TrayState.Low
-                        : TrayState.Normal;
+            state = StateFor(percent, pinned.Charging);
 
-            text = $"{pinned.Name}: {percent}%" + (pinned.Charging ? " (charging)" : string.Empty);
+            text = $"{pinned.Name}: {percent}% · {TrayIconRenderer.Describe(state)}";
         }
 
         _tray.Text = Truncate(text, MaxTooltipLength);
         SetTrayIcon(state, percent);
     }
+
+    /// <summary>Green/blue means fine, orange means low, red means charge now.</summary>
+    private TrayState StateFor(int percent, bool charging) => charging
+        ? TrayState.Charging
+        : percent <= 5
+            ? TrayState.Critical
+            : percent <= _settings.LowBatteryPercent
+                ? TrayState.Low
+                : TrayState.Normal;
 
     private void PinDevice(string key, string name)
     {
@@ -381,7 +384,7 @@ internal sealed class TrayAppContext : ApplicationContext
                          .ThenBy(s => s.Name, StringComparer.CurrentCultureIgnoreCase))
             {
                 string status = snapshot.Percent is int value
-                    ? value + "%" + (snapshot.Charging ? " (charging)" : string.Empty)
+                    ? $"{value}% · {TrayIconRenderer.Describe(StateFor(value, snapshot.Charging))}"
                     : "no battery answer";
 
                 var item = new ToolStripMenuItem($"{snapshot.Name}  —  {status}")
@@ -399,6 +402,9 @@ internal sealed class TrayAppContext : ApplicationContext
 
             if (string.IsNullOrEmpty(_settings.PinnedDeviceKey) && _snapshots.Count > 1)
                 _menu.Items.Add(Greyed("Click a mouse above to pin it to the tray"));
+
+            // Spells the icon colours out, so nobody has to guess what orange means.
+            _menu.Items.Add(Greyed("Green = good · orange = getting low · red = charge now · blue = charging"));
         }
 
         _menu.Items.Add(new ToolStripSeparator());

@@ -1,133 +1,128 @@
 # razer-tray-status
 
-A small Windows tray app that shows the battery level of your Razer wireless mice, with support
-for more than one mouse and a single pinned device in the tray. **Left-clicking the tray icon opens
-Razer Synapse.**
+Shows the battery level of your Razer wireless mice in the Windows system tray. It handles more than
+one mouse and lets you pin one of them to the tray.
 
-Battery levels are read straight from the mouse over USB HID (the protocol reverse-engineered by
-[OpenRazer](https://github.com/openrazer/openrazer)). Synapse does not need to be running to read
-the level — it only opens when you click the icon.
+Left-click the icon to open Razer Synapse. Right-click it for the menu.
+
+The level is read straight from the mouse over USB HID, using the protocol
+[OpenRazer](https://github.com/openrazer/openrazer) worked out. Synapse does not have to be running
+to read it. It only opens when you click the icon.
 
 ## Download
 
 Grab `RazerTrayStatus.exe` from the
 [latest release](https://github.com/goodgamescontact12345-wq/razer-tray-status/releases/latest) and
-run it. It is self-contained, so no .NET installation is needed. The exe is unsigned, so SmartScreen
-may warn on first launch: choose *More info*, then *Run anyway*.
+run it. There is nothing to install and no .NET needed. The exe is not signed, so SmartScreen may
+warn you the first time: click *More info*, then *Run anyway*.
 
-## Features
+## What it does
 
-- Every connected Razer mouse is listed in the tray menu with its live battery percentage.
-- Pin any one of them to the tray icon; the pin survives restarts and replugs.
-- Left click the tray icon → opens Razer Synapse (Synapse 4, falling back to Synapse 3).
-- Right click → your mice, *Open Razer Synapse*, *Refresh now*, *Settings* (poll interval, low-battery
-  level, start with Windows), *Device diagnostics…* and *Exit*.
-- The tray icon is a battery with the percentage drawn inside it as big, crisp digits. Its colour
-  explains the level at a glance (see below), and the menu spells the same thing out next to each
-  mouse: `95% · good`, `30% · getting low`, `12% · charge now`, `95% · charging`.
-- No drivers, no admin rights, no Synapse dependency for reading, no bundled image assets.
+- Every connected Razer mouse shows up in the menu with its battery percentage.
+- Pin one mouse to the tray icon. The pin survives restarts and replugging.
+- Left click: open Razer Synapse (4, falling back to 3).
+- Right click: your mice, *Open Razer Synapse*, *Refresh now*, *Settings* (how often to check, low
+  battery level, start with Windows), *Device diagnostics...* and *Exit*.
+- The icon is a small battery with the percentage inside it, and its colour tells you the level.
+- No drivers, no admin rights, nothing to install.
 - Settings live in `%APPDATA%\RazerTrayStatus\settings.json`.
 
-## What the colours mean
+## Colours
 
 | Colour | Meaning |
 | --- | --- |
 | Green | Plenty left |
-| Orange | Getting low — at or below your *Low battery at* setting (default 15%) |
-| Red | Charge now — 5% or less |
-| Blue | On the cable, charging |
-| Grey with `?` | No battery answer (mouse asleep or unreachable) |
+| Orange | Getting low: at or below your *Low battery at* setting, 15% by default |
+| Red | Charge now: 5% or less |
+| Blue | Plugged in and charging |
+| Grey with `?` | No answer from the mouse |
 
-Green, orange, red and blue are also the words shown in the menu and the hover tooltip, so the
-colours never have to be guessed.
+The menu says the same thing in words next to each mouse, like `72% · good` or `30% · getting low`,
+so you never have to guess at a colour.
 
 ## Requirements
 
 - Windows 10 or 11, 64-bit.
-- A Razer wireless mouse or its 2.4 GHz dongle plugged in.
-- Razer Synapse 4 or 3 installed if you want the click-through to work.
+- A Razer wireless mouse, or its 2.4 GHz dongle, plugged in.
+- Razer Synapse 4 or 3 if you want the left click to open it.
 
 ## Build
 
-Requires the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
+You need the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 
 ```bat
 build.cmd
 ```
 
-That produces a single self-contained `dist\RazerTrayStatus.exe` — no .NET runtime needed on the
-machine that runs it. Or run it directly from source:
+That gives you a single `dist\RazerTrayStatus.exe` that runs on its own, with no .NET installed on
+the machine that runs it. To run it from source instead:
 
 ```bat
 dotnet run --project src\RazerTrayStatus
 ```
 
-## Usage
+## Using it
 
-1. Start `RazerTrayStatus.exe`. If exactly one mouse is connected it is shown immediately.
-2. Right-click the tray icon and click a mouse to pin it to the tray (a checkmark marks the pinned one).
-3. Hover the icon for the exact percentage; left-click it to open Razer Synapse.
-4. *Refresh now* forces a read; *Settings → Refresh every* changes the polling interval (15 s, 30 s,
-   1 minute or 5 minutes, default 1 minute).
+1. Start `RazerTrayStatus.exe`. If one mouse is connected, it is shown straight away.
+2. Right-click the icon and click a mouse to pin it. A checkmark marks the pinned one.
+3. Hover the icon for the exact percentage. Left-click it to open Synapse.
+4. *Refresh now* reads the battery straight away. *Settings > Refresh every* changes how often it
+   checks: 15 seconds, 30 seconds, 1 minute or 5 minutes, 1 minute by default.
 
-When a mouse is detected but does not answer the battery query (for example while it is wired and
-charging, or asleep on its dongle) it is still listed, marked `no battery answer`, and is still
-pinnable — it simply shows no percentage until it answers again.
+If a mouse is found but does not answer, for example while it is wired and charging or asleep on its
+dongle, it still shows up in the menu as `no battery answer` and you can still pin it. It just has no
+percentage until it answers again.
 
-## Supported mice
+## Which mice work
 
-Any Razer wireless mouse that exposes the 90-byte HID control report works, **including while it is
-plugged in and charging over the cable**. Typical 2021+ models answer on transaction `0x1F`, older
-receivers on `0x3F` or `0xFF`; the app tries all three and remembers which one your device answered
-on.
+Any Razer wireless mouse that exposes the battery report over HID, including while it is plugged in
+and charging. Newer models answer on one transaction id, older receivers on another. The app tries
+all three and remembers which one your mouse used.
 
-A mouse exposes several HID collections (mouse, keyboard, vendor) and which one carries the battery
-command differs by model and by wired/wireless mode — so the app probes every collection of the
-device and remembers the one that answered. This is why a wired Viper V3 is found even though its
-battery channel is not on the same collection as on other models.
+One mouse shows up in Windows as several HID collections (mouse, keyboard, vendor). Which one
+carries the battery command depends on the model, so the app tries each of them and remembers the
+one that answered. That is why a wired Viper V3 is found even though its battery channel sits
+somewhere else.
 
-Wired-only mice have no battery and report nothing.
+Mice that only work wired have no battery and report nothing.
 
-## Troubleshooting
+## If something is wrong
 
-Right-click the tray icon and choose **Device diagnostics…** — it opens
-`%APPDATA%\RazerTrayStatus\probe.log` describing every HID collection Windows exposes for Razer
-hardware, its usage page and feature report length, and the result of **every I/O strategy**:
-feature report vs. output/input report, both handle access modes, and all three transaction ids.
-From a console you can get the same output with:
+Right-click the icon and choose *Device diagnostics...*. It opens
+`%APPDATA%\RazerTrayStatus\probe.log`, which lists every HID collection Windows sees for Razer
+hardware, its usage page, its feature report length, and what every attempt returned. From a console
+you get the same output with:
 
 ```bat
 RazerTrayStatus.exe --probe
 ```
 
-Common cases:
+Things that come up:
 
-- **"already running" dialog** — an older build is still in the tray (the app is single-instance).
-  Right-click its icon, choose *Exit*, then start the new build.
-- **Mouse is not listed at all** — Windows does not enumerate it as a HID device; check the cable or
-  dongle while the mouse is connected and try *Refresh now*. Detection reads the device interface
-  paths, so it does not depend on the collection being openable.
-- **"no battery answer"** — Windows sees the mouse but it did not answer any strategy. The log shows
-  the exact reason per attempt, for example `SetFeature failed (win32 87 (invalid parameter - feature
-  report rejected))`, `no input report (timeout)` or `no valid response (status 0x03)`.
-- **Nothing is logged** — check `%APPDATA%\RazerTrayStatus\agent.log` for crashes; the app reports
-  unhandled errors in a dialog instead of disappearing.
-- **Synapse does not open** — the app looks for
-  `C:\Program Files\Razer\RazerAppEngine\RazerAppEngine.exe` (Synapse 4, also under its
-  `app-<version>` folder) and then for Synapse 3's Razer Central. The error dialog lists the paths
-  it tried.
+- **"already running"** - an older copy is still in the tray. Right-click it, choose *Exit*, then
+  start the new one.
+- **The mouse is not listed** - Windows is not seeing it as a HID device. Check the cable or dongle
+  and try *Refresh now*.
+- **"no battery answer"** - Windows sees the mouse but it did not reply. The log says why for each
+  attempt, for example `SetFeature failed (win32 87 (invalid parameter - feature report rejected))`,
+  `no input report (timeout)` or `no valid response (status 0x03)`.
+- **Nothing is logged** - check `%APPDATA%\RazerTrayStatus\agent.log`. The app shows errors in a
+  dialog instead of vanishing.
+- **Synapse does not open** - the app looks for
+  `C:\Program Files\Razer\RazerAppEngine\RazerAppEngine.exe` (Synapse 4, also inside an
+  `app-<version>` folder), then for Synapse 3's Razer Central. The error dialog lists the paths it
+  tried.
 
 ## How it works
 
-`src/RazerTrayStatus/Hid` contains the whole hardware side: SetupAPI enumerates HID interfaces,
-each candidate is opened with `dwDesiredAccess = 0` so the mouse's exclusive `mouclass` lock does
-not block us, and the app sends the Razer feature report (command class `0x07`, id `0x80` for the
-level, `0x84` for charging). The level arrives as a `0..255` value which is scaled to a
-percentage. Polling runs on a background thread; the UI only touches results.
+`src/RazerTrayStatus/Hid` has the whole hardware side. SetupAPI lists the HID interfaces, each
+candidate is opened with `dwDesiredAccess = 0` so the mouse's exclusive `mouclass` lock does not get
+in the way, and the app sends Razer's feature report (command class `0x07`, id `0x80` for the level,
+`0x84` for charging). The level comes back as a `0..255` value which is turned into a percentage.
+Reading runs on a background thread and the UI only touches the results.
 
 ## Notes
 
-- The app opens Synapse with `--url-params=apps=synapse`, the argument Razer's own launcher uses to
-  show the Synapse window.
-- Only one instance runs at a time.
+- Synapse is opened with `--url-params=apps=synapse`, the same argument Razer's own launcher uses.
+- Only one copy runs at a time.
 - No telemetry, no network access.

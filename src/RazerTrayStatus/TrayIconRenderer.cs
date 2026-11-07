@@ -1,6 +1,8 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Drawing.Text;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace RazerTrayStatus;
@@ -19,40 +21,41 @@ internal enum TrayState
 /// <summary>
 /// Renders the tray icon with GDI+, so the app ships without image assets.
 ///
-/// The icon is a battery - terminal on top, body below - with the percentage drawn inside the
-/// body. Standing it upright is what leaves the whole 16 px width free for the digits, which is
-/// what keeps the number readable at tray size. The digits come from a hand-drawn 3x5 font and
-/// each one gets a 1 px dark halo, so neighbouring strokes never merge into a single white bar.
+/// The icon is a soft-filled battery - small rounded terminal on top, rounded body below - with
+/// the percentage set inside it in a real typeface. Everything is drawn at 4x and scaled down with
+/// a high-quality filter: at 16 px that is what separates a modern, smooth glyph from the blocky
+/// pixel font this used to use, while still keeping the digits large and legible.
 /// </summary>
 internal static class TrayIconRenderer
 {
-    /// <summary>3x5 pixel digits. '1' is one pixel wide so "100%" still fits at 16 px.</summary>
-    private static readonly Dictionary<char, string[]> Glyphs = new()
-    {
-        ['0'] = new[] { "111", "101", "101", "101", "111" },
-        ['1'] = new[] { "1", "1", "1", "1", "1" },
-        ['2'] = new[] { "111", "001", "111", "100", "111" },
-        ['3'] = new[] { "111", "001", "111", "001", "111" },
-        ['4'] = new[] { "101", "101", "111", "001", "001" },
-        ['5'] = new[] { "111", "100", "111", "001", "111" },
-        ['6'] = new[] { "111", "100", "111", "101", "111" },
-        ['7'] = new[] { "111", "001", "001", "001", "001" },
-        ['8'] = new[] { "111", "101", "111", "101", "111" },
-        ['9'] = new[] { "111", "101", "111", "001", "111" },
-        ['?'] = new[] { "111", "001", "011", "000", "010" },
-    };
+    /// <summary>Everything is drawn at this multiple of the final size, then downsampled.</summary>
+    private const int Supersample = 4;
 
     public static Icon Create(TrayState state, int percent, out IntPtr handle)
     {
         int size = IconSize();
+        int canvas = size * Supersample;
+
+        using var large = new Bitmap(canvas, canvas, PixelFormat.Format32bppArgb);
+
+        using (Graphics graphics = Graphics.FromImage(large))
+        {
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            graphics.TextRenderingHint = TextRenderingHint.AntiAlias;
+            graphics.Clear(Color.Transparent);
+            Draw(graphics, state, percent, canvas);
+        }
 
         using var bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb);
 
         using (Graphics graphics = Graphics.FromImage(bitmap))
         {
-            graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            graphics.Clear(Color.Transparent);
-            Draw(graphics, state, percent, size);
+            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            graphics.SmoothingMode = SmoothingMode.HighQuality;
+            graphics.CompositingQuality = CompositingQuality.HighQuality;
+            graphics.DrawImage(large, new Rectangle(0, 0, size, size));
         }
 
         handle = bitmap.GetHicon();
@@ -84,113 +87,162 @@ internal static class TrayIconRenderer
         _ => "no mouse",
     };
 
-    private static void Draw(Graphics graphics, TrayState state, int percent, int size)
+    private static void Draw(Graphics graphics, TrayState state, int percent, int canvas)
     {
         Color accent = ColorFor(state);
 
-        // Upright battery: small terminal on top, body below it, with a hair of space between.
-        float nubHeight = Math.Max(2f, size * 0.14f);
-        float nubWidth = size * 0.26f;
+        float unit = canvas / (float)Supersample; // one final pixel, in canvas units
+
+        // Small rounded terminal on top, rounded body below, with a hair of space between.
+        float nubHeight = Math.Max(2f, unit * 0.15f) * Supersample;
+        float nubWidth = unit * 0.30f * Supersample;
+        float gap = unit * 0.10f * Supersample;
 
         var body = new RectangleF(
-            0.5f,
-            nubHeight + 0.6f,
-            size - 1f,
-            size - 0.5f - (nubHeight + 0.6f));
+            unit * 0.5f,
+            nubHeight + gap,
+            canvas - unit,
+            canvas - unit * 0.5f - (nubHeight + gap));
 
-        var nub = new RectangleF((size - nubWidth) / 2f, 0.5f, nubWidth, nubHeight);
+        var nub = new RectangleF((canvas - nubWidth) / 2f, unit * 0.5f, nubWidth, nubHeight);
 
-        using GraphicsPath bodyPath = RoundedRect(body, Math.Max(1.5f, size * 0.12f));
-        using GraphicsPath nubPath = RoundedRect(nub, Math.Max(0.8f, size * 0.05f));
+        float bodyRadius = unit * 0.30f * Supersample;
+        float nubRadius = Math.Max(1f, unit * 0.05f * Supersample);
 
-        // One shared gradient so the terminal and the body look like a single object.
+        using GraphicsPath bodyPath = RoundedRect(body, bodyRadius);
+        using GraphicsPath nubPath = RoundedRect(nub, nubRadius);
+
+        // Soft vertical shade: lighter at the top, deeper at the bottom.
         using (var fill = new LinearGradientBrush(
-                   new RectangleF(0f, 0f, size, size),
-                   Blend(accent, 0.18f),
-                   Blend(accent, -0.10f),
+                   new RectangleF(0f, 0f, canvas, canvas),
+                   Blend(accent, 0.16f),
+                   Blend(accent, -0.12f),
                    90f))
         {
             graphics.FillPath(fill, bodyPath);
             graphics.FillPath(fill, nubPath);
         }
 
-        // A hairline highlight separates the battery from a dark or a light taskbar.
-        using (var ring = new Pen(Color.FromArgb(95, 255, 255, 255), Math.Max(1f, size * 0.055f)))
+        // Barely-there top highlight: the depth cue that stops it looking like a flat sticker.
+        graphics.SetClip(bodyPath);
+        using (var highlight = new SolidBrush(Color.FromArgb(30, 255, 255, 255)))
+            graphics.FillRectangle(highlight, body.X, body.Y, body.Width, body.Height * 0.10f);
+        graphics.ResetClip();
+
+        DrawPercent(graphics, percent is >= 0 and <= 100 ? percent.ToString() : "?", canvas);
+    }
+
+    /// <summary>Draws the percentage centred, cropping to the ink so the digits sit optically centred.</summary>
+    private static void DrawPercent(Graphics graphics, string text, int canvas)
+    {
+        using var layer = new Bitmap(canvas, canvas, PixelFormat.Format32bppArgb);
+
+        using (Graphics textGraphics = Graphics.FromImage(layer))
         {
-            graphics.DrawPath(ring, bodyPath);
-            graphics.DrawPath(ring, nubPath);
+            textGraphics.Clear(Color.Transparent);
+            textGraphics.TextRenderingHint = TextRenderingHint.AntiAlias;
+            textGraphics.SmoothingMode = SmoothingMode.AntiAlias;
+
+            float maxWidth = canvas * 0.74f;
+            float em = canvas * 0.86f;
+            using Font font = FitFont(textGraphics, text, em, maxWidth);
+
+            using var brush = new SolidBrush(Color.White);
+            using var format = (StringFormat)StringFormat.GenericTypographic.Clone();
+            format.FormatFlags |= StringFormatFlags.NoWrap | StringFormatFlags.NoClip;
+
+            textGraphics.DrawString(text, font, brush, 0f, 0f, format);
         }
 
-        DrawNumber(graphics, percent is >= 0 and <= 100 ? percent.ToString() : "?", size, body);
+        Rectangle ink = InkBounds(layer);
+        if (ink.Width <= 0 || ink.Height <= 0) return;
+
+        using Bitmap cropped = layer.Clone(ink, PixelFormat.Format32bppArgb);
+
+        graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+        graphics.DrawImage(
+            cropped,
+            new RectangleF(
+                (canvas - ink.Width) / 2f,
+                (canvas - ink.Height) / 2f,
+                ink.Width,
+                ink.Height));
     }
 
-    private static void DrawNumber(Graphics graphics, string text, int size, RectangleF body)
+    /// <summary>Largest bold UI font that still fits the width; Segoe UI is what Windows itself uses.</summary>
+    private static Font FitFont(Graphics graphics, string text, float em, float maxWidth)
     {
-        var glyphs = new List<string[]>(text.Length);
-        foreach (char character in text)
-            glyphs.Add(Glyphs.TryGetValue(character, out string[]? glyph) ? glyph : Glyphs['?']);
+        float[] candidates = { em, em * 0.94f, em * 0.88f, em * 0.82f, em * 0.76f, em * 0.70f };
+        Font? last = null;
 
-        // Two digits butt together and the dark halo separates them, which buys back the width
-        // the number needs at 16 px. Three digits keep a gap, or "100" reads as a row of bars.
-        int gap = glyphs.Count > 2 ? 1 : 0;
-
-        int units = 0;
-        foreach (string[] glyph in glyphs) units += glyph[0].Length;
-
-        int scale = Math.Max(1, size / 8);
-        while (scale > 1 && units * scale > size - 2) scale--;
-
-        int height = 5 * scale;
-        int cursor = (size - units * scale) / 2;
-        int top = (int)Math.Round(body.Y + (body.Height - height) / 2f);
-
-        SmoothingMode previous = graphics.SmoothingMode;
-        graphics.SmoothingMode = SmoothingMode.None;
-
-        // Dark halo first, so adjacent strokes never read as one thick white bar.
-        using (var halo = new SolidBrush(Color.FromArgb(120, 12, 12, 14)))
-            DrawGlyphs(graphics, glyphs, halo, cursor, top, scale, gap, inflate: 1);
-
-        using (var brush = new SolidBrush(Color.White))
-            DrawGlyphs(graphics, glyphs, brush, cursor, top, scale, gap, inflate: 0);
-
-        graphics.SmoothingMode = previous;
-    }
-
-    private static void DrawGlyphs(
-        Graphics graphics,
-        List<string[]> glyphs,
-        Brush brush,
-        int cursor,
-        int top,
-        int scale,
-        int gap,
-        int inflate)
-    {
-        int x = cursor;
-
-        foreach (string[] glyph in glyphs)
+        foreach (float candidate in candidates)
         {
-            int width = glyph[0].Length;
+            Font font = CreateFont(candidate);
+            last?.Dispose();
+            last = font;
 
-            for (int row = 0; row < glyph.Length; row++)
+            if (graphics.MeasureString(text, font, PointF.Empty, StringFormat.GenericTypographic).Width <= maxWidth)
+                return font;
+        }
+
+        return last ?? CreateFont(em * 0.70f);
+    }
+
+    private static Font CreateFont(float em)
+    {
+        foreach (string family in new[] { "Segoe UI Semibold", "Segoe UI", "Tahoma", "Arial" })
+        {
+            try
             {
-                string line = glyph[row];
+                return new Font(family, em, FontStyle.Bold, GraphicsUnit.Pixel);
+            }
+            catch (ArgumentException)
+            {
+                // Font family not installed: try the next one.
+            }
+        }
 
-                for (int column = 0; column < width; column++)
+        return new Font(FontFamily.GenericSansSerif, em, FontStyle.Bold, GraphicsUnit.Pixel);
+    }
+
+    /// <summary>Bounding box of the non-transparent pixels, so text can be centred by its ink.</summary>
+    private static Rectangle InkBounds(Bitmap bitmap)
+    {
+        BitmapData data = bitmap.LockBits(
+            new Rectangle(0, 0, bitmap.Width, bitmap.Height),
+            ImageLockMode.ReadOnly,
+            PixelFormat.Format32bppArgb);
+
+        try
+        {
+            int stride = data.Stride;
+            var buffer = new byte[stride * bitmap.Height];
+            Marshal.Copy(data.Scan0, buffer, 0, buffer.Length);
+
+            int minX = bitmap.Width, minY = bitmap.Height, maxX = -1, maxY = -1;
+
+            for (int y = 0; y < bitmap.Height; y++)
+            {
+                int row = y * stride;
+
+                for (int x = 0; x < bitmap.Width; x++)
                 {
-                    if (line[column] != '1') continue;
+                    if (buffer[row + x * 4 + 3] <= 8) continue;
 
-                    graphics.FillRectangle(
-                        brush,
-                        x + column * scale - inflate,
-                        top + row * scale - inflate,
-                        scale + inflate * 2,
-                        scale + inflate * 2);
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
                 }
             }
 
-            x += (width + gap) * scale;
+            if (maxX < minX || maxY < minY) return Rectangle.Empty;
+
+            return new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
+        }
+        finally
+        {
+            bitmap.UnlockBits(data);
         }
     }
 

@@ -21,10 +21,10 @@ internal enum TrayState
 /// <summary>
 /// Renders the tray icon with GDI+, so the app ships without image assets.
 ///
-/// The icon is a soft-filled battery - small rounded terminal on top, rounded body below - with
-/// the percentage set inside it in a real typeface. Everything is drawn at 4x and scaled down with
-/// a high-quality filter: at 16 px that is what separates a modern, smooth glyph from the blocky
-/// pixel font this used to use, while still keeping the digits large and legible.
+/// The icon is a battery lying on its side - wide rounded body, small terminal on the right - with
+/// the percentage set inside it in a real typeface. Lying it down is what makes the silhouette read
+/// as a battery; a square body with a tab on top reads as a jar. Everything is drawn at 4x and
+/// scaled down with a high-quality filter, so the edges are smooth at tray size.
 /// </summary>
 internal static class TrayIconRenderer
 {
@@ -44,7 +44,7 @@ internal static class TrayIconRenderer
             graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
             graphics.TextRenderingHint = TextRenderingHint.AntiAlias;
             graphics.Clear(Color.Transparent);
-            Draw(graphics, state, percent, canvas);
+            Draw(graphics, state, percent, size, canvas);
         }
 
         using var bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb);
@@ -87,32 +87,18 @@ internal static class TrayIconRenderer
         _ => "no mouse",
     };
 
-    private static void Draw(Graphics graphics, TrayState state, int percent, int canvas)
+    private static void Draw(Graphics graphics, TrayState state, int percent, int size, int canvas)
     {
         Color accent = ColorFor(state);
+        float s = canvas / (float)Supersample; // one final pixel, in canvas units
 
-        float unit = canvas / (float)Supersample; // one final pixel, in canvas units
+        // Wide body with a short terminal on the right: the classic battery silhouette.
+        var body = new RectangleF(s * 0.03f, s * 0.145f, s * 0.76f, s * 0.71f);
+        var terminal = new RectangleF(s * 0.82f, s * 0.34f, s * 0.15f, s * 0.32f);
 
-        // Small rounded terminal on top, rounded body below, with a hair of space between.
-        float nubHeight = Math.Max(2f, unit * 0.15f) * Supersample;
-        float nubWidth = unit * 0.30f * Supersample;
-        float gap = unit * 0.10f * Supersample;
+        using GraphicsPath bodyPath = RoundedRect(body, s * 0.115f);
+        using GraphicsPath terminalPath = RoundedRect(terminal, s * 0.035f);
 
-        var body = new RectangleF(
-            unit * 0.5f,
-            nubHeight + gap,
-            canvas - unit,
-            canvas - unit * 0.5f - (nubHeight + gap));
-
-        var nub = new RectangleF((canvas - nubWidth) / 2f, unit * 0.5f, nubWidth, nubHeight);
-
-        float bodyRadius = unit * 0.30f * Supersample;
-        float nubRadius = Math.Max(1f, unit * 0.05f * Supersample);
-
-        using GraphicsPath bodyPath = RoundedRect(body, bodyRadius);
-        using GraphicsPath nubPath = RoundedRect(nub, nubRadius);
-
-        // Soft vertical shade: lighter at the top, deeper at the bottom.
         using (var fill = new LinearGradientBrush(
                    new RectangleF(0f, 0f, canvas, canvas),
                    Blend(accent, 0.16f),
@@ -120,20 +106,24 @@ internal static class TrayIconRenderer
                    90f))
         {
             graphics.FillPath(fill, bodyPath);
-            graphics.FillPath(fill, nubPath);
+            graphics.FillPath(fill, terminalPath);
         }
 
         // Barely-there top highlight: the depth cue that stops it looking like a flat sticker.
         graphics.SetClip(bodyPath);
         using (var highlight = new SolidBrush(Color.FromArgb(30, 255, 255, 255)))
-            graphics.FillRectangle(highlight, body.X, body.Y, body.Width, body.Height * 0.10f);
+            graphics.FillRectangle(highlight, body.X, body.Y, body.Width, body.Height * 0.30f);
         graphics.ResetClip();
 
-        DrawPercent(graphics, percent is >= 0 and <= 100 ? percent.ToString() : "?", canvas);
+        DrawPercent(
+            graphics,
+            percent is >= 0 and <= 100 ? percent.ToString() : "?",
+            canvas,
+            body);
     }
 
-    /// <summary>Draws the percentage centred, cropping to the ink so the digits sit optically centred.</summary>
-    private static void DrawPercent(Graphics graphics, string text, int canvas)
+    /// <summary>Draws the percentage centred in the battery body, cropping to the ink so it is optically centred.</summary>
+    private static void DrawPercent(Graphics graphics, string text, int canvas, RectangleF body)
     {
         using var layer = new Bitmap(canvas, canvas, PixelFormat.Format32bppArgb);
 
@@ -143,8 +133,8 @@ internal static class TrayIconRenderer
             textGraphics.TextRenderingHint = TextRenderingHint.AntiAlias;
             textGraphics.SmoothingMode = SmoothingMode.AntiAlias;
 
-            float maxWidth = canvas * 0.74f;
-            float em = canvas * 0.86f;
+            float maxWidth = body.Width * 0.88f;
+            float em = body.Height * 0.98f;
             using Font font = FitFont(textGraphics, text, em, maxWidth);
 
             using var brush = new SolidBrush(Color.White);
@@ -159,12 +149,15 @@ internal static class TrayIconRenderer
 
         using Bitmap cropped = layer.Clone(ink, PixelFormat.Format32bppArgb);
 
+        float centreX = body.X + body.Width / 2f;
+        float centreY = body.Y + body.Height / 2f;
+
         graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
         graphics.DrawImage(
             cropped,
             new RectangleF(
-                (canvas - ink.Width) / 2f,
-                (canvas - ink.Height) / 2f,
+                centreX - ink.Width / 2f,
+                centreY - ink.Height / 2f,
                 ink.Width,
                 ink.Height));
     }
@@ -172,7 +165,16 @@ internal static class TrayIconRenderer
     /// <summary>Largest bold UI font that still fits the width; Segoe UI is what Windows itself uses.</summary>
     private static Font FitFont(Graphics graphics, string text, float em, float maxWidth)
     {
-        float[] candidates = { em, em * 0.94f, em * 0.88f, em * 0.82f, em * 0.76f, em * 0.70f };
+        float[] candidates =
+        {
+            em,
+            em * 0.92f,
+            em * 0.84f,
+            em * 0.76f,
+            em * 0.68f,
+            em * 0.60f,
+        };
+
         Font? last = null;
 
         foreach (float candidate in candidates)
@@ -185,7 +187,7 @@ internal static class TrayIconRenderer
                 return font;
         }
 
-        return last ?? CreateFont(em * 0.70f);
+        return last ?? CreateFont(em * 0.60f);
     }
 
     private static Font CreateFont(float em)

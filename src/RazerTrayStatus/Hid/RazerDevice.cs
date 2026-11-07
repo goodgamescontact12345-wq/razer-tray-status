@@ -2,6 +2,23 @@ using System.Runtime.InteropServices;
 
 namespace RazerTrayStatus.Hid;
 
+internal enum IoMode
+{
+    /// <summary>HidD_SetFeature / HidD_GetFeature.</summary>
+    Feature,
+
+    /// <summary>HID output report + input report (what several Razer devices demand on Windows).</summary>
+    OutputInput,
+}
+
+internal sealed record ReadOutcome(
+    bool Success,
+    int Percent,
+    bool Charging,
+    byte TransactionId,
+    IoMode Mode,
+    string? Error);
+
 /// <summary>
 /// One Razer HID collection and the battery queries that run against it.
 ///
@@ -11,9 +28,9 @@ namespace RazerTrayStatus.Hid;
 ///   Battery: class 0x07 id 0x80, args[1] is 0..255 -> percent
 ///   Charging: class 0x07 id 0x84, args[1] is 0/1
 ///
-/// A single physical mouse exposes several collections (mouse, keyboard, vendor); only some of
-/// them answer, and which one differs between models and between wired and wireless mode. That is
-/// why the app groups these into <see cref="RazerMouse"/> and probes each in turn.
+/// A physical mouse exposes several collections (mouse, keyboard, vendor) and which one answers
+/// differs by model and by wired/wireless mode. <see cref="Read"/> therefore walks every
+/// transaction id and both I/O strategies until something replies.
 /// </summary>
 internal sealed class RazerDevice
 {
@@ -24,6 +41,7 @@ internal sealed class RazerDevice
     private const byte GetChargingStatus = 0x84;
     private const int ReportLength = 90;
     private const byte StatusSuccess = 0x02;
+    private const int InputReportAttempts = 2;
 
     /// <summary>Transaction ids to try, in order: modern mice, older receivers, then the legacy default.</summary>
     public static readonly byte[] TransactionIds = { 0x1F, 0x3F, 0xFF };
@@ -35,7 +53,9 @@ internal sealed class RazerDevice
         ushort productId,
         int featureReportLength,
         ushort usagePage,
-        ushort usage)
+        ushort usage,
+        bool opened = true,
+        string? openError = null)
     {
         DevicePath = devicePath;
         ProductName = productName;
@@ -44,6 +64,8 @@ internal sealed class RazerDevice
         FeatureReportLength = featureReportLength;
         UsagePage = usagePage;
         Usage = usage;
+        Opened = opened;
+        OpenError = openError;
     }
 
     public string DevicePath { get; }
@@ -53,6 +75,11 @@ internal sealed class RazerDevice
     public int FeatureReportLength { get; }
     public ushort UsagePage { get; }
     public ushort Usage { get; }
+
+    /// <summary>False when the collection could not be opened at all; it is still listed and retried.</summary>
+    public bool Opened { get; }
+
+    public string? OpenError { get; }
 
     /// <summary>True for the collection Windows itself uses as a mouse (usage page 1, usage 2).</summary>
     public bool IsMouseCollection => UsagePage == 0x01 && Usage == 0x02;
@@ -68,85 +95,137 @@ internal sealed class RazerDevice
     public static int PercentFromRaw(byte raw) => Math.Clamp((int)Math.Round(raw * 100.0 / 255.0), 0, 100);
 
     /// <summary>
-    /// Reads level and charging state. Mice are locked by mouclass for read/write, so a
-    /// zero-access (feature-report-only) handle is tried first, then a full-access one.
+    /// Reads level and charging state, trying the remembered strategy first and then every
+    /// remaining combination of I/O mode, handle access and transaction id.
     /// </summary>
-    public bool TryRead(byte transactionId, out int percent, out bool charging, out string error)
+    public ReadOutcome Read(DevicePreference? preference)
     {
-        percent = 0;
-        charging = false;
-        error = "could not open device";
-
-        foreach (bool zeroAccess in new[] { true, false })
+        List<byte> transactionIds = TransactionIds.ToList();
+        if (preference?.TransactionId is byte preferredId && transactionIds.Contains(preferredId))
         {
-            IntPtr handle = NativeHid.OpenDevice(DevicePath, zeroAccess);
-            if (handle == NativeHid.InvalidHandle) continue;
+            transactionIds.Remove(preferredId);
+            transactionIds.Insert(0, preferredId);
+        }
 
-            try
+        List<IoMode> modes = new() { IoMode.Feature, IoMode.OutputInput };
+        if (string.Equals(preference?.IoMode, nameof(IoMode.OutputInput), StringComparison.OrdinalIgnoreCase))
+            modes.Reverse();
+
+        string lastError = Opened ? "no answer" : "could not open device (" + (OpenError ?? "unknown error") + ")";
+        byte lastTransactionId = transactionIds[0];
+
+        foreach (IoMode mode in modes)
+        {
+            lastTransactionId = transactionIds[0];
+
+            // Feature reports work on a zero-access handle; output/input reports need read/write
+            // access plus overlapped I/O.
+            HidAccess[] accessModes = mode == IoMode.Feature
+                ? new[] { HidAccess.None, HidAccess.ReadWrite }
+                : new[] { HidAccess.ReadWrite };
+
+            foreach (HidAccess access in accessModes)
             {
-                if (TryRead(handle, transactionId, out percent, out charging, out error)) return true;
-            }
-            finally
-            {
-                NativeHid.CloseHandle(handle);
+                foreach (byte transactionId in transactionIds)
+                {
+                    lastTransactionId = transactionId;
+                    IntPtr handle = NativeHid.OpenDevice(DevicePath, access, overlapped: mode == IoMode.OutputInput);
+
+                    if (handle == NativeHid.InvalidHandle)
+                    {
+                        lastError = "could not open device (" + NativeHid.DescribeError(Marshal.GetLastWin32Error()) + ")";
+                        break; // a different transaction id will not open the device either
+                    }
+
+                    try
+                    {
+                        int percent = 0;
+                        bool charging = false;
+
+                        if (TryQuery(handle, mode, transactionId, out percent, out charging, out string error))
+                            return new ReadOutcome(true, percent, charging, transactionId, mode, null);
+
+                        lastError = error;
+                    }
+                    finally
+                    {
+                        NativeHid.CloseHandle(handle);
+                    }
+                }
             }
         }
 
-        return false;
+        return new ReadOutcome(false, 0, false, lastTransactionId, IoMode.Feature, lastError);
     }
 
-    private bool TryRead(IntPtr handle, byte transactionId, out int percent, out bool charging, out string error)
+    /// <summary>Every strategy with its outcome, for the diagnostics log.</summary>
+    public List<string> ProbeAll()
+    {
+        var lines = new List<string>();
+
+        foreach (IoMode mode in new[] { IoMode.Feature, IoMode.OutputInput })
+        {
+            HidAccess[] accessModes = mode == IoMode.Feature
+                ? new[] { HidAccess.None, HidAccess.ReadWrite }
+                : new[] { HidAccess.ReadWrite };
+
+            foreach (HidAccess access in accessModes)
+            {
+                IntPtr handle = NativeHid.OpenDevice(DevicePath, access, overlapped: mode == IoMode.OutputInput);
+                if (handle == NativeHid.InvalidHandle)
+                {
+                    lines.Add($"    {mode}/{access}: could not open ({NativeHid.DescribeError(Marshal.GetLastWin32Error())})");
+                    continue;
+                }
+
+                try
+                {
+                    foreach (byte transactionId in TransactionIds)
+                    {
+                        bool ok = TryQuery(handle, mode, transactionId, out int percent, out bool charging, out string error);
+                        lines.Add(ok
+                            ? $"    {mode}/{access}/tid 0x{transactionId:X2}: OK {percent}%{(charging ? " charging" : string.Empty)}"
+                            : $"    {mode}/{access}/tid 0x{transactionId:X2}: {error}");
+                    }
+                }
+                finally
+                {
+                    NativeHid.CloseHandle(handle);
+                }
+            }
+        }
+
+        return lines;
+    }
+
+    private bool TryQuery(
+        IntPtr handle,
+        IoMode mode,
+        byte transactionId,
+        out int percent,
+        out bool charging,
+        out string error)
     {
         percent = 0;
         charging = false;
 
-        if (!TryQuery(handle, transactionId, GetBatteryLevel, out byte[] battery, out error)) return false;
+        if (!Exchange(handle, mode, transactionId, GetBatteryLevel, out byte[] battery, out error)) return false;
 
         percent = PercentFromRaw(battery[9]);
 
-        if (TryQuery(handle, transactionId, GetChargingStatus, out byte[] charge, out _))
+        if (Exchange(handle, mode, transactionId, GetChargingStatus, out byte[] charge, out _))
             charging = charge[9] != 0;
 
         return true;
     }
 
-    /// <summary>Diagnostic read used by --probe and the diagnostics menu item.</summary>
-    public bool TryProbe(byte transactionId, out string details)
-    {
-        details = string.Empty;
-
-        foreach (bool zeroAccess in new[] { true, false })
-        {
-            IntPtr handle = NativeHid.OpenDevice(DevicePath, zeroAccess);
-            if (handle == NativeHid.InvalidHandle) continue;
-
-            try
-            {
-                var parts = new List<string>();
-
-                bool batteryOk = TryQuery(handle, transactionId, GetBatteryLevel, out byte[] battery, out string batteryError);
-                parts.Add(batteryOk
-                    ? $"battery raw=0x{battery[9]:X2} -> {PercentFromRaw(battery[9])}%"
-                    : "battery: " + batteryError);
-
-                if (TryQuery(handle, transactionId, GetChargingStatus, out byte[] charge, out string chargeError))
-                    parts.Add($"charging={(charge[9] != 0 ? "yes" : "no")}");
-                else
-                    parts.Add("charging: " + chargeError);
-
-                details = string.Join(", ", parts);
-                if (batteryOk) return true;
-            }
-            finally
-            {
-                NativeHid.CloseHandle(handle);
-            }
-        }
-
-        return false;
-    }
-
-    private bool TryQuery(IntPtr handle, byte transactionId, byte commandId, out byte[] payload, out string error)
+    private bool Exchange(
+        IntPtr handle,
+        IoMode mode,
+        byte transactionId,
+        byte commandId,
+        out byte[] payload,
+        out string error)
     {
         payload = Array.Empty<byte>();
         error = string.Empty;
@@ -158,22 +237,48 @@ internal sealed class RazerDevice
         request[0] = 0x00; // report id
         Array.Copy(frame, 0, request, 1, frame.Length);
 
-        if (!NativeHid.HidD_SetFeature(handle, request, length))
+        if (mode == IoMode.Feature)
         {
-            error = $"SetFeature failed (win32 {Marshal.GetLastWin32Error()})";
+            if (!NativeHid.HidD_SetFeature(handle, request, length))
+            {
+                error = $"SetFeature failed ({NativeHid.DescribeError(Marshal.GetLastWin32Error())})";
+                return false;
+            }
+
+            var featureResponse = new byte[length];
+            featureResponse[0] = 0x00; // report id, required on input
+
+            if (!NativeHid.HidD_GetFeature(handle, featureResponse, length))
+            {
+                error = $"GetFeature failed ({NativeHid.DescribeError(Marshal.GetLastWin32Error())})";
+                return false;
+            }
+
+            return TryParseResponse(featureResponse, out payload, out error);
+        }
+
+        if (!NativeHid.WriteOutputReport(handle, request, length, NativeHid.IoTimeoutMilliseconds))
+        {
+            error = $"WriteFile failed ({NativeHid.DescribeError(Marshal.GetLastWin32Error())})";
             return false;
         }
 
         var response = new byte[length];
-        response[0] = 0x00; // report id, required on input
 
-        if (!NativeHid.HidD_GetFeature(handle, response, length))
+        for (int attempt = 0; attempt < InputReportAttempts; attempt++)
         {
-            error = $"GetFeature failed (win32 {Marshal.GetLastWin32Error()})";
-            return false;
+            int read = NativeHid.ReadInputReport(handle, response, NativeHid.IoTimeoutMilliseconds);
+            if (read <= 0)
+            {
+                error = "no input report (timeout)";
+                return false;
+            }
+
+            if (TryParseResponse(response, out payload, out _)) return true;
         }
 
-        return TryParseResponse(response, out payload, out error);
+        error = "input reports contained no battery reply";
+        return false;
     }
 
     public static byte[] BuildRequest(byte transactionId, byte commandClass, byte commandId, byte dataSize = 0x02)
@@ -198,7 +303,7 @@ internal sealed class RazerDevice
 
     private static bool TryParseResponse(byte[] response, out byte[] payload, out string error)
     {
-        // HidD_GetFeature includes the report id as byte 0 when the device uses one; try both layouts.
+        // The report id is byte 0 when the device uses one; try both layouts.
         foreach (int offset in new[] { 1, 0 })
         {
             if (response.Length < offset + ReportLength) continue;

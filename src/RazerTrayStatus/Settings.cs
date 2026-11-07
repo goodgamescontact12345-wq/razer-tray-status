@@ -2,6 +2,19 @@ using System.Text.Json;
 
 namespace RazerTrayStatus;
 
+/// <summary>What worked for one device, remembered so later polls need a single round trip.</summary>
+internal sealed class DevicePreference
+{
+    /// <summary>HID collection that answered.</summary>
+    public string? ControlPath { get; set; }
+
+    /// <summary>Razer protocol transaction id that answered.</summary>
+    public byte TransactionId { get; set; }
+
+    /// <summary>I/O strategy that answered: Feature or OutputInput.</summary>
+    public string? IoMode { get; set; }
+}
+
 internal sealed class Settings
 {
     /// <summary>Stable device key (serial) of the mouse pinned to the tray.</summary>
@@ -16,11 +29,8 @@ internal sealed class Settings
 
     public bool StartWithWindows { get; set; }
 
-    /// <summary>Working protocol transaction id per device, learned on first successful read.</summary>
-    public Dictionary<string, byte> TransactionIds { get; set; } = new();
-
-    /// <summary>Which HID collection answered for a device, learned on first successful read.</summary>
-    public Dictionary<string, string> ControlPaths { get; set; } = new();
+    /// <summary>Learned working strategy per device.</summary>
+    public Dictionary<string, DevicePreference> Preferences { get; set; } = new();
 }
 
 internal sealed class SettingsStore
@@ -49,7 +59,7 @@ internal sealed class SettingsStore
     {
         try
         {
-            System.IO.Directory.CreateDirectory(DirectoryPath);
+            Directory.CreateDirectory(DirectoryPath);
             string json = JsonSerializer.Serialize(settings, SerializerOptions);
             string temporary = FilePath + ".tmp";
             File.WriteAllText(temporary, json);
@@ -58,6 +68,22 @@ internal sealed class SettingsStore
         catch
         {
             // Settings are a convenience: never crash the tray over a failed write.
+        }
+    }
+
+    /// <summary>Appends a line to the runtime log (kept small, only written on problems).</summary>
+    public void Log(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(DirectoryPath);
+            File.AppendAllText(
+                Path.Combine(DirectoryPath, "agent.log"),
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}{Environment.NewLine}");
+        }
+        catch
+        {
+            // Logging must never throw.
         }
     }
 }

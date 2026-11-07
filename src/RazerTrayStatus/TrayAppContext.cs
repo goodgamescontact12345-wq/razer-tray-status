@@ -12,6 +12,7 @@ internal sealed record DeviceSnapshot(
     bool Charging,
     byte TransactionId,
     string? ControlPath,
+    string? IoMode,
     string? Error);
 
 internal sealed class TrayAppContext : ApplicationContext
@@ -27,6 +28,8 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private Settings _settings;
     private bool _polling;
+    private bool _announcedNoDevices;
+    private bool _announcedNoAnswer;
     private Icon? _icon;
     private IntPtr _iconHandle = IntPtr.Zero;
 
@@ -112,19 +115,27 @@ internal sealed class TrayAppContext : ApplicationContext
         _polling = true;
 
         // Snapshot the learned state so the worker never touches the live settings object.
-        var cachedTransactionIds = new Dictionary<string, byte>(_settings.TransactionIds, StringComparer.OrdinalIgnoreCase);
-        var cachedControlPaths = new Dictionary<string, string>(_settings.ControlPaths, StringComparer.OrdinalIgnoreCase);
+        var preferences = _settings.Preferences.ToDictionary(
+            pair => pair.Key,
+            pair => new DevicePreference
+            {
+                ControlPath = pair.Value.ControlPath,
+                TransactionId = pair.Value.TransactionId,
+                IoMode = pair.Value.IoMode,
+            },
+            StringComparer.OrdinalIgnoreCase);
 
         Task.Run(() =>
         {
             List<DeviceSnapshot> snapshots;
             try
             {
-                snapshots = PollDevices(cachedTransactionIds, cachedControlPaths);
+                snapshots = PollDevices(preferences);
             }
             catch (Exception ex)
             {
                 Debug.WriteLine(ex);
+                _store.Log("poll failed: " + ex);
                 snapshots = new List<DeviceSnapshot>();
             }
 
@@ -152,67 +163,47 @@ internal sealed class TrayAppContext : ApplicationContext
         }
     }
 
-    private static List<DeviceSnapshot> PollDevices(
-        Dictionary<string, byte> cachedTransactionIds,
-        Dictionary<string, string> cachedControlPaths)
+    private static List<DeviceSnapshot> PollDevices(Dictionary<string, DevicePreference> preferences)
     {
         var snapshots = new List<DeviceSnapshot>();
 
-        foreach (RazerMouse mouse in DeviceScanner.Scan(cachedControlPaths))
+        foreach (RazerMouse mouse in DeviceScanner.Scan(preferences))
         {
-            byte transactionId = cachedTransactionIds.TryGetValue(mouse.Key, out byte cached)
-                ? cached
-                : RazerDevice.TransactionIds[0];
+            preferences.TryGetValue(mouse.Key, out DevicePreference? preference);
 
             bool answered = false;
-            int percent = 0;
-            bool charging = false;
-            string error = "no answer";
+            ReadOutcome? outcome = null;
             string? controlPath = null;
+            string error = "no answer";
 
-            // A mouse exposes several HID collections; the battery channel is not always the mouse
-            // one, so every collection is tried until one answers.
+            // A mouse exposes several HID collections and only some of them answer, so every
+            // collection is tried until one replies.
             foreach (RazerDevice device in mouse.Interfaces)
             {
-                if (!TryReadInterface(device, ref transactionId, out percent, out charging, out error)) continue;
+                ReadOutcome result = device.Read(preference);
+                if (result.Success)
+                {
+                    answered = true;
+                    outcome = result;
+                    controlPath = device.DevicePath;
+                    break;
+                }
 
-                answered = true;
-                controlPath = device.DevicePath;
-                break;
+                error = result.Error ?? error;
             }
 
             snapshots.Add(new DeviceSnapshot(
                 mouse.Key,
                 mouse.DisplayName,
-                answered ? percent : null,
-                answered && charging,
-                transactionId,
+                answered ? outcome!.Percent : null,
+                answered && outcome!.Charging,
+                answered ? outcome!.TransactionId : (byte)0x1F,
                 controlPath,
+                answered ? outcome!.Mode.ToString() : null,
                 answered ? null : error));
         }
 
         return snapshots;
-    }
-
-    private static bool TryReadInterface(
-        RazerDevice device,
-        ref byte transactionId,
-        out int percent,
-        out bool charging,
-        out string error)
-    {
-        if (device.TryRead(transactionId, out percent, out charging, out error)) return true;
-
-        foreach (byte candidate in RazerDevice.TransactionIds)
-        {
-            if (candidate == transactionId) continue;
-            if (!device.TryRead(candidate, out percent, out charging, out error)) continue;
-
-            transactionId = candidate;
-            return true;
-        }
-
-        return false;
     }
 
     private void ApplyPollResult(List<DeviceSnapshot> snapshots)
@@ -226,24 +217,79 @@ internal sealed class TrayAppContext : ApplicationContext
 
             if (snapshot.Error is not null) continue;
 
-            if (!_settings.TransactionIds.TryGetValue(snapshot.Key, out byte existingId) || existingId != snapshot.TransactionId)
+            if (!_settings.Preferences.TryGetValue(snapshot.Key, out DevicePreference? preference))
             {
-                _settings.TransactionIds[snapshot.Key] = snapshot.TransactionId;
-                settingsChanged = true;
+                preference = new DevicePreference();
+                _settings.Preferences[snapshot.Key] = preference;
             }
 
-            if (snapshot.ControlPath is { Length: > 0 } path &&
-                (!_settings.ControlPaths.TryGetValue(snapshot.Key, out string? current) ||
-                 !string.Equals(current, path, StringComparison.OrdinalIgnoreCase)))
-            {
-                _settings.ControlPaths[snapshot.Key] = path;
-                settingsChanged = true;
-            }
+            bool changed =
+                !string.Equals(preference.ControlPath, snapshot.ControlPath, StringComparison.OrdinalIgnoreCase) ||
+                preference.TransactionId != snapshot.TransactionId ||
+                !string.Equals(preference.IoMode, snapshot.IoMode, StringComparison.OrdinalIgnoreCase);
+
+            if (!changed) continue;
+
+            preference.ControlPath = snapshot.ControlPath;
+            preference.TransactionId = snapshot.TransactionId;
+            preference.IoMode = snapshot.IoMode;
+            settingsChanged = true;
         }
 
         if (settingsChanged) _store.Save(_settings);
 
         UpdateTray();
+        AnnounceProblems();
+    }
+
+    /// <summary>
+    /// Makes a failure visible instead of leaving the user staring at an empty tray. Runs at most
+    /// once per situation per session, and writes the diagnostics log so it can be sent on.
+    /// </summary>
+    private void AnnounceProblems()
+    {
+        if (_snapshots.Count == 0 && !_announcedNoDevices)
+        {
+            _announcedNoDevices = true;
+            _store.Log("poll: no Razer HID collections found");
+            WriteDiagnosticsInBackground();
+
+            _tray.ShowBalloonTip(
+                8000,
+                "Razer tray status",
+                "No Razer mouse found. Right-click the icon, choose Device diagnostics… and send the log.",
+                ToolTipIcon.Warning);
+            return;
+        }
+
+        if (_snapshots.Count > 0 && _snapshots.Values.All(snapshot => snapshot.Percent is null) && !_announcedNoAnswer)
+        {
+            _announcedNoAnswer = true;
+            _store.Log("poll: device found, no battery answer from any collection");
+            WriteDiagnosticsInBackground();
+
+            _tray.ShowBalloonTip(
+                8000,
+                "Razer tray status",
+                "Razer mouse found but it gave no battery answer. Right-click, Device diagnostics… for details.",
+                ToolTipIcon.Warning);
+        }
+    }
+
+    /// <summary>Writes probe.log without blocking the tray, so the log is ready to send.</summary>
+    private static void WriteDiagnosticsInBackground()
+    {
+        Task.Run(() =>
+        {
+            try
+            {
+                Probe.BuildReport();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex);
+            }
+        });
     }
 
     private DeviceSnapshot? PinnedSnapshot()
@@ -291,7 +337,7 @@ internal sealed class TrayAppContext : ApplicationContext
         else if (pinned.Percent is null)
         {
             state = TrayState.Asleep;
-            text = $"{pinned.Name}: no battery answer (wired or idle)";
+            text = $"{pinned.Name}: no battery answer";
         }
         else
         {
@@ -331,7 +377,8 @@ internal sealed class TrayAppContext : ApplicationContext
         else
         {
             foreach (DeviceSnapshot snapshot in _snapshots.Values
-                         .OrderBy(s => s.Name, StringComparer.CurrentCultureIgnoreCase))
+                         .OrderBy(s => s.Percent is null)
+                         .ThenBy(s => s.Name, StringComparer.CurrentCultureIgnoreCase))
             {
                 string status = snapshot.Percent is int value
                     ? value + "%" + (snapshot.Charging ? " (charging)" : string.Empty)

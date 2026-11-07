@@ -1,9 +1,20 @@
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace RazerTrayStatus.Hid;
 
+internal enum HidAccess
+{
+    /// <summary>Feature-report-only access; works for collections the mouse driver holds open.</summary>
+    None,
+
+    Read,
+
+    ReadWrite,
+}
+
 /// <summary>
-/// Thin P/Invoke layer over setupapi.dll / hid.dll.
+/// Thin P/Invoke layer over setupapi.dll / hid.dll / kernel32.dll.
 /// No third-party HID library is used, so the app has no runtime dependencies.
 /// </summary>
 internal static class NativeHid
@@ -11,6 +22,9 @@ internal static class NativeHid
     public static readonly IntPtr InvalidHandle = new(-1);
 
     public const int HidpStatusSuccess = 0x00110000;
+    public const int ErrorIoPending = 997;
+    // Kept short: a silent device must not stall a poll for long.
+    public const int IoTimeoutMilliseconds = 400;
 
     private const int DigcfPresent = 0x02;
     private const int DigcfDeviceInterface = 0x10;
@@ -20,8 +34,7 @@ internal static class NativeHid
     private const uint FileShareRead = 0x01;
     private const uint FileShareWrite = 0x02;
     private const uint OpenExisting = 3;
-
-    private static readonly Guid HidInterfaceGuid = new("4d1e55b2-f16f-11cf-88cb-001111000030");
+    private const uint FileFlagOverlapped = 0x40000000;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SP_DEVICE_INTERFACE_DATA
@@ -115,6 +128,9 @@ internal static class NativeHid
     [DllImport("hid.dll", SetLastError = true)]
     public static extern bool HidD_SetFeature(IntPtr device, byte[] reportBuffer, int reportBufferLength);
 
+    [DllImport("hid.dll")]
+    public static extern void HidD_GetHidGuid(out Guid hidGuid);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateFile(
         string fileName,
@@ -134,11 +150,49 @@ internal static class NativeHid
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool DestroyIcon(IntPtr icon);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadFile(
+        IntPtr hFile,
+        byte[] lpBuffer,
+        uint nNumberOfBytesToRead,
+        IntPtr lpNumberOfBytesRead,
+        ref NativeOverlapped lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool WriteFile(
+        IntPtr hFile,
+        byte[] lpBuffer,
+        uint nNumberOfBytesToWrite,
+        IntPtr lpNumberOfBytesWritten,
+        ref NativeOverlapped lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetOverlappedResult(
+        IntPtr hFile,
+        ref NativeOverlapped lpOverlapped,
+        out uint lpNumberOfBytesTransferred,
+        bool bWait);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CancelIoEx(IntPtr hFile, ref NativeOverlapped lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateEvent(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    public static Guid GetHidInterfaceGuid()
+    {
+        HidD_GetHidGuid(out Guid guid);
+        return guid;
+    }
+
     /// <summary>Returns every HID device interface path currently present on the system.</summary>
-    public static List<string> EnumerateHidDevicePaths()
+    public static List<string> EnumerateHidDevicePaths(Guid interfaceGuid)
     {
         var paths = new List<string>();
-        Guid guid = HidInterfaceGuid;
+        Guid guid = interfaceGuid;
         IntPtr deviceInfoSet = SetupDiGetClassDevs(ref guid, IntPtr.Zero, IntPtr.Zero, DigcfPresent | DigcfDeviceInterface);
         if (deviceInfoSet == InvalidHandle) return paths;
 
@@ -184,20 +238,82 @@ internal static class NativeHid
         return paths;
     }
 
-    /// <summary>
-    /// Opens a HID collection. Mice are owned exclusively by mouclass, so zero access
-    /// (feature-report-only) is the normal choice; callers retry with full access when needed.
-    /// </summary>
-    public static IntPtr OpenDevice(string devicePath, bool zeroAccess = true)
+    public static IntPtr OpenDevice(string devicePath, HidAccess access = HidAccess.None, bool overlapped = false)
     {
+        uint desiredAccess = access switch
+        {
+            HidAccess.Read => GenericRead,
+            HidAccess.ReadWrite => GenericRead | GenericWrite,
+            _ => 0,
+        };
+
+        uint flags = overlapped ? FileFlagOverlapped : 0;
+
         return CreateFile(
             devicePath,
-            zeroAccess ? 0u : GenericRead | GenericWrite,
+            desiredAccess,
             FileShareRead | FileShareWrite,
             IntPtr.Zero,
             OpenExisting,
-            0,
+            flags,
             IntPtr.Zero);
+    }
+
+    /// <summary>Writes a HID output report (used by devices that reject feature reports on Windows).</summary>
+    public static bool WriteOutputReport(IntPtr handle, byte[] buffer, int length, int timeoutMilliseconds)
+    {
+        IntPtr eventHandle = CreateEvent(IntPtr.Zero, true, false, null);
+        if (eventHandle == IntPtr.Zero) return false;
+
+        try
+        {
+            var overlapped = new NativeOverlapped { EventHandle = eventHandle };
+
+            if (!WriteFile(handle, buffer, (uint)length, IntPtr.Zero, ref overlapped))
+            {
+                if (Marshal.GetLastWin32Error() != ErrorIoPending) return false;
+                if (WaitForSingleObject(eventHandle, (uint)timeoutMilliseconds) != 0)
+                {
+                    CancelIoEx(handle, ref overlapped);
+                    return false;
+                }
+            }
+
+            return GetOverlappedResult(handle, ref overlapped, out _, true);
+        }
+        finally
+        {
+            CloseHandle(eventHandle);
+        }
+    }
+
+    /// <summary>Reads one HID input report, bounded by a timeout. Returns bytes read, or -1.</summary>
+    public static int ReadInputReport(IntPtr handle, byte[] buffer, int timeoutMilliseconds)
+    {
+        IntPtr eventHandle = CreateEvent(IntPtr.Zero, true, false, null);
+        if (eventHandle == IntPtr.Zero) return -1;
+
+        try
+        {
+            var overlapped = new NativeOverlapped { EventHandle = eventHandle };
+
+            if (!ReadFile(handle, buffer, (uint)buffer.Length, IntPtr.Zero, ref overlapped))
+            {
+                if (Marshal.GetLastWin32Error() != ErrorIoPending) return -1;
+                if (WaitForSingleObject(eventHandle, (uint)timeoutMilliseconds) != 0)
+                {
+                    CancelIoEx(handle, ref overlapped);
+                    return -1;
+                }
+            }
+
+            if (!GetOverlappedResult(handle, ref overlapped, out uint transferred, true)) return -1;
+            return (int)Math.Min(transferred, (uint)buffer.Length);
+        }
+        finally
+        {
+            CloseHandle(eventHandle);
+        }
     }
 
     public static string ReadString(IntPtr handle, Func<IntPtr, byte[], int, bool> getter)
@@ -210,4 +326,20 @@ internal static class NativeHid
         if (terminator >= 0) value = value[..terminator];
         return value.Trim();
     }
+
+    /// <summary>Turns a Win32 error into something readable in the diagnostics log.</summary>
+    public static string DescribeError(int error) => error switch
+    {
+        0 => "ok",
+        2 => "win32 2 (file not found)",
+        5 => "win32 5 (access denied)",
+        21 => "win32 21 (device not ready)",
+        23 => "win32 23 (data error)",
+        31 => "win32 31 (general failure)",
+        32 => "win32 32 (in use by another process)",
+        87 => "win32 87 (invalid parameter - feature report rejected)",
+        1167 => "win32 1167 (device not connected)",
+        121 => "win32 121 (semaphore timeout)",
+        _ => $"win32 {error}",
+    };
 }

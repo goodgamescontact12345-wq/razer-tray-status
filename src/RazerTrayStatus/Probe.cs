@@ -5,9 +5,9 @@ using RazerTrayStatus.Hid;
 namespace RazerTrayStatus;
 
 /// <summary>
-/// Diagnostics behind <c>--probe</c> and the tray's "Device diagnostics…" item. It reports what is
-/// present and what each collection answers, so a mouse that reads as "no battery answer" can be
-/// diagnosed instead of simply not working.
+/// Diagnostics behind <c>--probe</c> and the tray's "Device diagnostics…" item. It reports the HID
+/// collections Windows exposes and what every I/O strategy answered, so a mouse that reads as
+/// "no battery answer" can be diagnosed instead of simply not working.
 /// </summary>
 internal static class Probe
 {
@@ -40,15 +40,19 @@ internal static class Probe
         builder.AppendLine("Razer tray status - diagnostics");
         builder.AppendLine($"Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         builder.AppendLine($"OS:   {Environment.OSVersion}");
+        builder.AppendLine($"64-bit process: {Environment.Is64BitProcess}");
         builder.AppendLine();
 
-        List<string> interfaces = DeviceScanner.DescribeAll();
-        builder.AppendLine($"Razer HID collections present: {interfaces.Count}");
-        foreach (string line in interfaces) builder.AppendLine("  " + line);
+        int hidInterfaces = DeviceScanner.CountHidInterfaces();
+        builder.AppendLine($"HID collections on this PC: {hidInterfaces}");
+
+        List<string> razerInterfaces = DeviceScanner.DescribeAll();
+        builder.AppendLine($"Razer HID collections (VID 1532): {razerInterfaces.Count}");
+        foreach (string line in razerInterfaces) builder.AppendLine("  " + line);
 
         builder.AppendLine();
 
-        List<RazerMouse> mice = DeviceScanner.Scan(new Dictionary<string, string>());
+        List<RazerMouse> mice = DeviceScanner.Scan(new Dictionary<string, DevicePreference>());
         builder.AppendLine($"Mouse groups: {mice.Count}");
 
         foreach (RazerMouse mouse in mice)
@@ -63,19 +67,16 @@ internal static class Probe
                     $"    usagePage 0x{device.UsagePage:X2} usage 0x{device.Usage:X2} " +
                     $"feature {device.FeatureReportLength}B mouseCollection={device.IsMouseCollection}");
 
-                foreach (byte transactionId in RazerDevice.TransactionIds)
-                {
-                    bool ok = device.TryProbe(transactionId, out string details);
-                    builder.AppendLine($"    transaction 0x{transactionId:X2}: {(ok ? "OK" : "no answer")} - {details}");
-                }
+                foreach (string line in device.ProbeAll()) builder.AppendLine(line);
             }
         }
 
         if (mice.Count == 0)
         {
             builder.AppendLine();
-            builder.AppendLine("No Razer mouse collection was found at all.");
-            builder.AppendLine("Check that the mouse or its dongle is plugged in, then run diagnostics again.");
+            builder.AppendLine("No Razer HID collection was found at all.");
+            builder.AppendLine("If the mouse is plugged in, this means Windows does not enumerate it as a");
+            builder.AppendLine("HID device at all (check Device Manager while the cable is connected).");
         }
 
         builder.AppendLine();

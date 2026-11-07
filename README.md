@@ -69,9 +69,10 @@ Wired-only mice have no battery and report nothing.
 ## Troubleshooting
 
 Right-click the tray icon and choose **Device diagnostics…** — it opens
-`%APPDATA%\RazerTrayStatus\probe.log` describing every Razer HID collection, its usage page and
-feature report length, and what each transaction id answered. From a console you can get the same
-output with:
+`%APPDATA%\RazerTrayStatus\probe.log` describing every HID collection Windows exposes for Razer
+hardware, its usage page and feature report length, and the result of **every I/O strategy**:
+feature report vs. output/input report, both handle access modes, and all three transaction ids.
+From a console you can get the same output with:
 
 ```bat
 RazerTrayStatus.exe --probe
@@ -79,11 +80,16 @@ RazerTrayStatus.exe --probe
 
 Common cases:
 
-- **Mouse is not listed at all** — the mouse or dongle is not enumerated; check the cable/dongle and
-  wake the mouse, then *Refresh now*.
-- **"no battery answer"** — Windows sees the mouse but it refused the battery query over the cable.
-  The diagnostics log shows the exact failure (`SetFeature failed (win32 5)`, `no valid response`,
-  and so on) for each collection and transaction id.
+- **"already running" dialog** — an older build is still in the tray (the app is single-instance).
+  Right-click its icon, choose *Exit*, then start the new build.
+- **Mouse is not listed at all** — Windows does not enumerate it as a HID device; check the cable or
+  dongle while the mouse is connected and try *Refresh now*. Detection reads the device interface
+  paths, so it does not depend on the collection being openable.
+- **"no battery answer"** — Windows sees the mouse but it did not answer any strategy. The log shows
+  the exact reason per attempt, for example `SetFeature failed (win32 87 (invalid parameter - feature
+  report rejected))`, `no input report (timeout)` or `no valid response (status 0x03)`.
+- **Nothing is logged** — check `%APPDATA%\RazerTrayStatus\agent.log` for crashes; the app reports
+  unhandled errors in a dialog instead of disappearing.
 - **Synapse does not open** — the app looks for
   `C:\Program Files\Razer\RazerAppEngine\RazerAppEngine.exe` (Synapse 4, also under its
   `app-<version>` folder) and then for Synapse 3's Razer Central. The error dialog lists the paths
